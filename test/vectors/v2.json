@@ -1,0 +1,35 @@
+{
+  "protocol": "tesera-v2",
+  "hkdf": {
+    "hash": "sha256",
+    "ikm": "session secret",
+    "salt": "session id",
+    "aeadInfo": "tesera-aead-v2",
+    "macInfo": "tesera-mac-v2",
+    "length": 32
+  },
+  "nonce": "12 bytes: eight 0x00 bytes, then the block id as uint32 big-endian",
+  "plaintext": "one fin byte (0 or 1), sentAtMs as uint64 big-endian, then the body. The 16-byte Poly1305 tag is appended to the ciphertext.",
+  "aad": "28 bytes: version, data frame type 1, session id, block id uint32 big-endian, k, n, cipherLen uint16 big-endian, shardLen uint16 big-endian. The tessera index is not included.",
+  "inputs": {
+    "sessionSecret": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "sessionId": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "otherSessionId": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "blockId": 7,
+    "k": 2,
+    "n": 3,
+    "fin": false,
+    "sentAtMs": 1700000000000,
+    "plaintext": "746573657261"
+  },
+  "expected": {
+    "aeadKey": "6e91b4d573d471ad4f98255aee08dea759c9f3ce7fbc83c57a58d53a71a1d93a",
+    "macKey": "0b0bebe2de73709a1a60079fb3f66363fb09d81efdfc51ea6642fa9f917c7041",
+    "otherAeadKey": "f050a9c8d4ced8421fcb48627aa32ed5b30b894837801cd3d389a80c5b306156",
+    "otherMacKey": "98a6946ee4bc8db3054bfa7da3770152ae7ff67ed329d0a72107b65720d49bb4",
+    "aad": "0201a0a1a2a3a4a5a6a7a8a9aaabacadaeaf000000070203001f0010",
+    "ciphertext": "97ff233900290b435ca557ecda83cde2840df2c5fccca57561448811f6bc5d",
+    "ackFrame": "0202a0a1a2a3a4a5a6a7a8a9aaabacadaeaf00000007bd91e77f1afd8d85e12bedcffe2a9f53",
+    "controlMac": "bd91e77f1afd8d85e12bedcffe2a9f53"
+  }
+}
