@@ -124,13 +124,13 @@ without `--access open`, the relay is private, and the default caps stay on
 
 ### systemd
 
-[deploy/tesera-relay.service](deploy/tesera-relay.service) is a sample unit for a public relay
+[deploy/tesera-relay.service](deploy/tesera-relay.service) is a sample unit for a public relay that joins the tesera bootstrap relay, with that relay's id pinned
 
-it runs as user `tesera`, keeps the identity, peers, policy, and metrics under `/var/lib/tesera`, and drops privileges
+[deploy/tesera-seed.service](deploy/tesera-seed.service) is a sample unit for a seed that other relays join. it passes `--access open` and keeps joined relays in a peers file
 
-the sample passes `--access open`
+both run as user `tesera`, keep their files under `/var/lib/tesera`, drop privileges, and restart 15 seconds after a failure
 
-a relay you start without that flag stays private, and the default caps stay on
+a relay you start without `--access open` stays private, and the default caps stay on
 
 ### join the network
 
@@ -141,12 +141,18 @@ npm run tesera -- relay \
   --listen 0.0.0.0:4101 \
   --allow-remote \
   --identity relay.secret \
-  --join relay.tesera.net
+  --join relay:es36gsfwxo2mcrmzl2neokxl6svtc4oowkb3j5xhcjgnxxyzkykq@relay.tesera.net
 ```
 
 a hostname without a port uses port 4101
 
-tesera resolves the hostname once and keeps the resulting IPv4 address
+`relay:ID@` pins the seed's relay id. the relay checks the id that signed the seed's peer table and refuses a seed with any other id. without it, the relay joins whichever seed answers at that address
+
+joining a seed on another machine needs `--allow-remote`
+
+if the first join fails, the relay tries again for 60 seconds, then exits with an error
+
+once joined, the relay reads the seed's signed peer table every minute. if the seed no longer lists it, the relay joins again, looking the hostname up again first. while the seed doesn't answer, the checks slow down to one every 5 minutes
 
 ## relay options
 
@@ -278,10 +284,14 @@ by default, a relay is limited to:
 bandwidth        5 mbps
 sessions         8
 new peers        6 per minute
-datagrams        100 per second
+datagrams        2000 per second
 ```
 
 the bandwidth limit is shared across all traffic forwarded by the relay
+
+the datagram limit counts every forwarded datagram, including samples, acknowledgements, and negative acknowledgements. a 1-of-1 block costs a relay about 3 datagrams, so 2000 per second leaves room for the 5 mbps limit
+
+a dropped datagram looks like loss to the sender, which slows down and sends again later
 
 a bare bandwidth value is treated as megabits per second. values can also include a unit, such as `500kbps` or `50mbps`. use `0` to remove the limit
 
@@ -402,6 +412,8 @@ GET /v0/record
 ```
 
 `/v0/relay` describes only the current relay process, including uptime, forwarded datagrams and bytes, data frames, acknowledgements, negative acknowledgements, repeated tesserae, and datagrams that were refused or could not be parsed
+
+`limited` counts datagrams an operator limit dropped. `limitedBy` splits that count by `session`, `datagram`, `bandwidth`, `destination`, and `table`. the relay also prints `event=limited` with the same split at most every 30 seconds while drops continue
 
 `/v0/peers` lists the relays this seed knows. each one has its id, address, whether it is online, when it was last heard, and the bytes and transfers it reported
 

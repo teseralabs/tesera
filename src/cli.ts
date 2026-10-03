@@ -3,9 +3,9 @@ import { createHash, randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
 import { open, readFile, writeFile } from "node:fs/promises"
 import { resolve } from "node:path"
-import { DEFAULT_RELAY_PORT, resolveEndpoint, resolveRelayRef } from "./carrier/resolve.js"
+import { DEFAULT_RELAY_PORT, resolveEndpoint, resolveRelayRef, splitRelayRef } from "./carrier/resolve.js"
 import { listenPublicApi } from "./api/public.js"
-import { normalizeHost, parseEndpoint, parseListen, type Endpoint } from "./carrier/udp.js"
+import { isLoopback, normalizeHost, parseEndpoint, parseListen, type Endpoint } from "./carrier/udp.js"
 import { confirmRelay } from "./identity/confirm.js"
 import { identityFromSecret, generateIdentity, type Identity } from "./identity/id.js"
 import {
@@ -20,7 +20,7 @@ import { discoverRelays } from "./identity/peers.js"
 import { readRelaySnapshot } from "./identity/stats.js"
 import { allowsLog, formatLog, type LogFields, type LogLevel } from "./log.js"
 import { parseLogLevel, parsePeerTtl } from "./relay/config.js"
-import { canonicalRelayId, fillPolicy, parseAccess, parseBandwidth, readPolicy, writePolicy } from "./relay/policy.js"
+import { canonicalRelayId, DEFAULT_DATAGRAM_RATE, fillPolicy, parseAccess, parseBandwidth, readPolicy, writePolicy } from "./relay/policy.js"
 import { formatSession, parseSession } from "./crypto/session.js"
 import { Relay } from "./relay/relay.js"
 import { fillAdversity, type Adversity } from "./sim/network.js"
@@ -30,15 +30,15 @@ import { asError } from "./util.js"
 
 const HELP = `tesera session
 tesera id [--out FILE]
-tesera relay --listen 0.0.0.0:4101 [--identity FILE] [--join relay.tesera.net] [--allow-remote] [--allow-dest CIDR] [--advertise HOST:PORT] [--name TEXT] [--record-file FILE] [--record-ttl SECONDS] [--access private] [--bandwidth 5mbps] [--max-sessions 8] [--peer-rate 6] [--datagram-rate 100] [--policy-file FILE] [--allow RELAY] [--block RELAY] [--log-level info] [--metrics-file FILE] [--peers-file FILE] [--api HOST:PORT] [--peer-ttl 30d]
+tesera relay --listen 0.0.0.0:4101 [--identity FILE] [--join [relay:ID@]relay.tesera.net] [--allow-remote] [--allow-dest CIDR] [--advertise HOST:PORT] [--name TEXT] [--record-file FILE] [--record-ttl SECONDS] [--access private] [--bandwidth 5mbps] [--max-sessions 8] [--peer-rate 6] [--datagram-rate 2000] [--policy-file FILE] [--allow RELAY] [--block RELAY] [--log-level info] [--metrics-file FILE] [--peers-file FILE] [--api HOST:PORT] [--peer-ttl 30d]
 tesera info relay:ID@host:port [--json]
 tesera allow RELAY --policy-file FILE
 tesera block RELAY --policy-file FILE
 tesera unblock RELAY --policy-file FILE
 tesera forget RELAY --policy-file FILE
-tesera api --listen 127.0.0.1:4190 [--discover relay.tesera.net] [--advertise 127.0.0.1] [--trust-proxy ADDR] [--log-level info]
-tesera recv --listen 0.0.0.0:4200 --sender HOST:4300 --discover relay.tesera.net --session SESSION --output FILE
-tesera send --listen 0.0.0.0:4300 --receiver HOST:4200 --discover relay.tesera.net --session SESSION --input FILE
+tesera api --listen 127.0.0.1:4190 [--discover [relay:ID@]relay.tesera.net] [--advertise 127.0.0.1] [--trust-proxy ADDR] [--log-level info]
+tesera recv --listen 0.0.0.0:4200 --sender HOST:4300 --discover [relay:ID@]relay.tesera.net --session SESSION --output FILE
+tesera send --listen 0.0.0.0:4300 --receiver HOST:4200 --discover [relay:ID@]relay.tesera.net --session SESSION --input FILE
 tesera stats --via relay.tesera.net [--json]
 `
 
@@ -158,8 +158,9 @@ async function resolveRelays(flags: Flags, role: "sender" | "receiver"): Promise
   const listed = optionalString(flags, "relays")
   if (discover !== undefined && listed !== undefined) throw new Error("use either --discover or --relays")
   if (discover !== undefined) {
-    const seed = await resolveEndpoint(discover, DEFAULT_RELAY_PORT)
-    const found = await discoverRelays(seed)
+    const ref = await resolveRelayRef(discover)
+    const seed = ref.endpoint
+    const found = await discoverRelays(seed, { pinned: ref.id })
     console.log(formatLog(role, "discover", { relays: found.length, via: `${seed.host}:${seed.port}` }))
     return found.map((relay) => relay.endpoint)
   }
@@ -249,18 +250,26 @@ async function runRelay(argv: string[]): Promise<void> {
   }
   const joinText = optionalString(flags, "join")
   if (joinText && !identity) throw new Error("--join needs --identity")
-  const join = joinText ? await resolveEndpoint(joinText, DEFAULT_RELAY_PORT) : null
+  const access = parseAccess(optionalString(flags, "access") ?? "private")
+  if (access === "open" && !identity) {
+    throw new Error("--access open needs --identity, because a relay without one cannot answer joins")
+  }
+  const join = joinText ? splitRelayRef(joinText) : null
+  const allowRemote = flagOn(flags, "allow-remote")
+  if (join && !allowRemote && !isLoopbackName(join.host)) {
+    throw new Error("--join needs --allow-remote, because a relay without it cannot answer a remote seed")
+  }
   const logLevel = parseLogLevel(optionalString(flags, "log-level") ?? "info")
   const metricsFile = optionalString(flags, "metrics-file")
   const peersFile = optionalString(flags, "peers-file")
   const policyFile = optionalString(flags, "policy-file")
   const apiText = optionalString(flags, "api")
   const policy = fillPolicy({
-    access: parseAccess(optionalString(flags, "access") ?? "private"),
+    access,
     bandwidthBps: parseBandwidth(optionalString(flags, "bandwidth") ?? "5mbps"),
     maxSessions: intFlag(flags, "max-sessions", 8),
     peerRatePerMin: intFlag(flags, "peer-rate", 6),
-    datagramRatePerSec: intFlag(flags, "datagram-rate", 100),
+    datagramRatePerSec: intFlag(flags, "datagram-rate", DEFAULT_DATAGRAM_RATE),
     allowed: repeated(argv, "allow").map(canonicalRelayId),
     blocked: repeated(argv, "block").map(canonicalRelayId),
   })
@@ -268,7 +277,7 @@ async function runRelay(argv: string[]): Promise<void> {
     host: listen.host,
     port: listen.port,
     seed: intFlag(flags, "seed", 1),
-    allowRemote: flagOn(flags, "allow-remote"),
+    allowRemote,
     allowDest: repeated(argv, "allow-dest"),
     adversity: adversityFromFlags(flags),
     identity,
@@ -288,9 +297,17 @@ async function runRelay(argv: string[]): Promise<void> {
   const endpoint = await relay.start()
   emit("info", logLevel, "relay", "listen", { addr: `${endpoint.host}:${endpoint.port}` })
   if (identity) emit("info", logLevel, "relay", "id", { id: identity.id })
-  if (join) {
-    await relay.join(join)
-    emit("info", logLevel, "relay", "joined", { addr: `${join.host}:${join.port}` })
+  if (joinText && join) {
+    try {
+      await relay.stayJoined({
+        label: `${join.host}:${join.port}`,
+        id: join.id,
+        resolve: async () => (await resolveRelayRef(joinText)).endpoint,
+      })
+    } catch (err) {
+      await relay.close()
+      throw err
+    }
   }
   await new Promise<void>((resolve) => {
     const stop = () => {
@@ -310,6 +327,14 @@ async function runRelay(argv: string[]): Promise<void> {
     limited: stats.droppedLimited,
     bytes: stats.forwardedBytes,
   })
+}
+
+function isLoopbackName(host: string): boolean {
+  try {
+    return isLoopback(normalizeHost(host))
+  } catch {
+    return false
+  }
 }
 
 function recordFileFor(identityValue: string | undefined, explicit: string | undefined): string | undefined {
@@ -409,10 +434,11 @@ async function runApi(argv: string[]): Promise<void> {
   const flags = parseFlags(argv)
   const listen = parseListen(requiredString(flags, "listen"))
   const logLevel = parseLogLevel(optionalString(flags, "log-level") ?? "info")
-  const discover = await resolveEndpoint(optionalString(flags, "discover") ?? "relay.tesera.net", DEFAULT_RELAY_PORT)
+  const discover = await resolveRelayRef(optionalString(flags, "discover") ?? "relay.tesera.net")
   const advertise = normalizeHost(optionalString(flags, "advertise") ?? "127.0.0.1")
   const api = await listenPublicApi(listen.host, listen.port, {
-    discover,
+    discover: discover.endpoint,
+    discoverId: discover.id,
     advertise,
     trustProxy: repeated(argv, "trust-proxy"),
     log: (event, fields) => {
@@ -453,24 +479,26 @@ async function runRecv(flags: Flags): Promise<void> {
       hash.update(chunk)
       bytes += chunk.length
     }
-  } finally {
     await output.close()
+    const stats = receiver.stats
+    const recovery = receiver.recoveryCounts()
+    const latencyMs = stats.latencyCount > 0 ? stats.latencySumMs / stats.latencyCount : 0
+    console.log(
+      formatLog("receiver", "done", {
+        bytes,
+        sha256: hash.digest("hex"),
+        blocks: stats.blocksDecoded,
+        partial: recovery.blocksWithoutAllTesserae,
+        acks: stats.acksSent,
+        nacks: stats.nacksSent,
+        "latency-ms": latencyMs.toFixed(1),
+      }),
+    )
+    await receiver.linger()
+  } finally {
+    await output.close().catch(() => {})
     await receiver.close()
   }
-  const stats = receiver.stats
-  const recovery = receiver.recoveryCounts()
-  const latencyMs = stats.latencyCount > 0 ? stats.latencySumMs / stats.latencyCount : 0
-  console.log(
-    formatLog("receiver", "done", {
-      bytes,
-      sha256: hash.digest("hex"),
-      blocks: stats.blocksDecoded,
-      partial: recovery.blocksWithoutAllTesserae,
-      acks: stats.acksSent,
-      nacks: stats.nacksSent,
-      "latency-ms": latencyMs.toFixed(1),
-    }),
-  )
 }
 
 async function runSend(flags: Flags): Promise<void> {

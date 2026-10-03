@@ -4,7 +4,7 @@
 
 import { createHash } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { DEFAULT_RELAY_PORT, resolveEndpoint, resolveRelayRef } from "../carrier/resolve.js"
+import { resolveRelayRef } from "../carrier/resolve.js"
 import { isLoopback, normalizeHost, type Endpoint } from "../carrier/udp.js"
 import {
   DEFAULT_MAX_SENDS,
@@ -56,6 +56,8 @@ export class ApiError extends Error {
 export type PublicApiOptions = {
   /** Seed used when a call names neither relays nor a discover host. */
   discover: Endpoint
+  /** That seed's relay id, when the operator pinned it. */
+  discoverId?: string | null
   /** Address relays can send back to. Loopback binds there. Any other address binds all interfaces. */
   advertise: string
   maxBytes?: number
@@ -228,7 +230,7 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
         return
       }
       if (path === "/v0/peers") {
-        const found = await discoverRelays(opts.discover).catch(() => null)
+        const found = await discoverRelays(opts.discover, { pinned: opts.discoverId }).catch(() => null)
         if (!found) throw new ApiError(502, "peers")
         sendJson(res, 200, {
           relays: found.map((relay) => ({ id: relay.id, host: relay.endpoint.host, port: relay.endpoint.port })),
@@ -252,7 +254,7 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
       const payload = side === "send" ? await readBody(req, maxBytes) : await drain(req, maxBytes)
       if (side === "send" && payload.length === 0) throw new ApiError(400, "empty")
       if (side === "send") admit(limiter.addBytes(ip, payload.length))
-      const relays = await resolveCallRelays(req, opts.discover)
+      const relays = await resolveCallRelays(req, opts.discover, opts.discoverId ?? null)
       const outcome = await enter(sessionKey(session), {
         side,
         session,
@@ -494,14 +496,14 @@ function readCoding(req: IncomingMessage): Coding {
   return { k, n, shardSize, window, maxSends, retxAfterMs, nackAfterMs }
 }
 
-async function resolveCallRelays(req: IncomingMessage, fallback: Endpoint): Promise<Endpoint[]> {
+async function resolveCallRelays(req: IncomingMessage, fallback: Endpoint, fallbackId: string | null): Promise<Endpoint[]> {
   const listed = headerText(req, "x-tesera-relays")
   const discover = headerText(req, "x-tesera-discover")
   if (listed !== undefined && discover !== undefined) throw new ApiError(400, "option")
   try {
     if (listed !== undefined) return await listedRelays(listed)
-    const seed = discover !== undefined ? await resolveEndpoint(discover, DEFAULT_RELAY_PORT) : fallback
-    const found = await discoverRelays(seed)
+    const ref = discover !== undefined ? await resolveRelayRef(discover) : { id: fallbackId, endpoint: fallback }
+    const found = await discoverRelays(ref.endpoint, { pinned: ref.id })
     if (found.length < 1) throw new ApiError(400, "relays")
     return found.map((relay) => relay.endpoint)
   } catch (err) {

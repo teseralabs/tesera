@@ -1,8 +1,12 @@
 import { readFile, rename, writeFile } from "node:fs/promises"
 import { formatId, parseId } from "../identity/id.js"
+import type { LimitedBy } from "../metrics.js"
 
 /** Who may join this relay. `private` is the safe default. `open` is a public relay. */
 export type Access = "open" | "private"
+
+/** Which cap dropped a datagram. `destination` and `table` are counted by the relay. */
+export type LimitReason = keyof LimitedBy
 
 export type OperatorPolicy = {
   access: Access
@@ -24,6 +28,12 @@ export type PolicyFile = {
   forget: string[]
 }
 
+/**
+ * A 1-of-1 block costs the relay a 1068-byte tessera, a 50-byte sample, and a
+ * 49-byte ACK, about 389 bytes a datagram. 5 mbps is about 1,600 of those a
+ * second. The rest is room for NACKs and for ACKs copied to several relays.
+ */
+export const DEFAULT_DATAGRAM_RATE = 2_000
 const SESSION_IDLE_MS = 30_000
 const PEER_WINDOW_MS = 60_000
 
@@ -34,7 +44,7 @@ export function safePolicy(): OperatorPolicy {
     bandwidthBps: 625_000,
     maxSessions: 8,
     peerRatePerMin: 6,
-    datagramRatePerSec: 100,
+    datagramRatePerSec: DEFAULT_DATAGRAM_RATE,
     allowed: [],
     blocked: [],
   }
@@ -159,13 +169,18 @@ export class PolicyGate {
     return this.blocked.has(id)
   }
 
-  /** Drop a datagram that would pass the operator caps. Session slots are not spent on a drop. */
-  admitDatagram(bytes: number, session: string | null, now = Date.now()): boolean {
-    if (session && !this.roomForSession(session, now)) return false
-    if (!this.datagrams.take(1, now)) return false
-    if (!this.bandwidth.take(bytes, now)) return false
+  /**
+   * Null admits the datagram. Otherwise the cap that was full. Nothing is
+   * spent on a drop, so a datagram refused by one cap does not use up another.
+   */
+  admitDatagram(bytes: number, session: string | null, now = Date.now()): LimitReason | null {
+    if (session && !this.roomForSession(session, now)) return "session"
+    if (!this.datagrams.has(1, now)) return "datagram"
+    if (!this.bandwidth.has(bytes, now)) return "bandwidth"
+    this.datagrams.take(1, now)
+    this.bandwidth.take(bytes, now)
     if (session) this.sessions.set(session, now)
-    return true
+    return null
   }
 
   /** A brand-new peer. A relay we already know does not spend this budget. */
@@ -205,14 +220,22 @@ class Bucket {
     this.tokens = perSec
   }
 
-  take(n: number, now: number): boolean {
+  has(n: number, now: number): boolean {
     if (this.perSec <= 0) return true
+    this.refill(now)
+    return this.tokens >= n
+  }
+
+  take(n: number, now: number): boolean {
+    if (!this.has(n, now)) return false
+    if (this.perSec > 0) this.tokens -= n
+    return true
+  }
+
+  private refill(now: number): void {
     const elapsed = Math.max(0, now - this.at) / 1000
     this.at = now
     this.tokens = Math.min(this.perSec, this.tokens + elapsed * this.perSec)
-    if (this.tokens < n) return false
-    this.tokens -= n
-    return true
   }
 }
 

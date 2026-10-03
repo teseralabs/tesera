@@ -22,18 +22,21 @@ export async function resolveRelayRef(
   value: string,
   lookupHost?: HostLookup,
 ): Promise<RelayRef> {
+  const { id, host, port } = splitRelayRef(value)
+  return { id, endpoint: await resolveEndpoint(`${host}:${port}`, DEFAULT_RELAY_PORT, lookupHost) }
+}
+
+/** Check a relay reference without a DNS lookup. */
+export function splitRelayRef(value: string): { id: string | null; host: string; port: number } {
   const trimmed = value.trim()
   const at = trimmed.indexOf("@")
-  if (at === -1) return { id: null, endpoint: await resolveEndpoint(trimmed, DEFAULT_RELAY_PORT, lookupHost) }
+  if (at === -1) return { id: null, ...splitHostPort(trimmed, DEFAULT_RELAY_PORT) }
   const idText = trimmed.slice(0, at)
   const endpointText = trimmed.slice(at + 1)
   if (!idText.toLowerCase().startsWith(ID_PREFIX) || endpointText.length === 0) {
     throw new Error(`expected host:port, a domain name, or relay:ID@host, got ${trimmed}`)
   }
-  return {
-    id: formatId(parseId(idText)),
-    endpoint: await resolveEndpoint(endpointText, DEFAULT_RELAY_PORT, lookupHost),
-  }
+  return { id: formatId(parseId(idText)), ...splitHostPort(endpointText, DEFAULT_RELAY_PORT) }
 }
 
 async function resolveHost(host: string, lookupHost: HostLookup): Promise<string> {

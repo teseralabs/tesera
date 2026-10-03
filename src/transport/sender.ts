@@ -5,12 +5,15 @@ import { encodeShards, splitCiphertext } from "../coding/reedsolomon.js"
 import {
   assertCode,
   assertShardSize,
+  DEFAULT_IDLE_MS,
   DEFAULT_MAX_SENDS,
   DEFAULT_RETX_AFTER_MS,
   DEFAULT_SHARD,
   DEFAULT_TICK_MS,
   DEFAULT_WINDOW,
   fullBlockBodySize,
+  MAX_RETX_BACKOFF_MS,
+  MIN_WINDOW,
 } from "../constants.js"
 import { assertSession, blockAad, deriveKeys, seal, sealedLength } from "../crypto/session.js"
 import { emptySenderStats, type SenderStats } from "../metrics.js"
@@ -34,6 +37,8 @@ type BlockState = {
   placements: Array<Placement | null>
   sends: number
   nextRetxAt: number
+  /** Wait before the next timed resend. Doubles after each resend. */
+  backoffMs: number
   acked: boolean
 }
 
@@ -49,7 +54,10 @@ export type SenderOptions = {
   window?: number
   maxSends?: number
   retxAfterMs?: number
+  /** Total time allowed from the first block. Omitted means no total limit. */
   deadlineMs?: number
+  /** Time allowed without a block acknowledgement while blocks are in flight. */
+  idleMs?: number
   tickMs?: number
 }
 
@@ -68,6 +76,8 @@ export class TeseraSender {
   private readonly maxSends: number
   private readonly retxAfterMs: number
   private readonly deadlineMs: number
+  private readonly idleMs: number
+  private readonly maxBackoffMs: number
   private readonly tickMs: number
   private readonly bindHost: string
   private readonly bindPort: number
@@ -96,6 +106,12 @@ export class TeseraSender {
   private opened = false
   /** performance.now() of the last send or reply. The first send starts the stall clock. */
   private lastProgressAt = 0
+  /** Blocks allowed in flight. Loss halves it once per window, each window of ACKs adds one. */
+  private congestion = 0
+  /** Loss on a block below this id was already answered by the last cut. */
+  private recoverFrom = 0
+  /** Date.now() of the last block ACK, or of the send that started a busy period. */
+  private lastAckAt = 0
 
   constructor(opts: SenderOptions) {
     assertSession(opts.session)
@@ -115,7 +131,11 @@ export class TeseraSender {
     if (!Number.isInteger(this.window) || this.window < 1) throw new Error("window must be >= 1")
     this.maxSends = opts.maxSends ?? DEFAULT_MAX_SENDS
     this.retxAfterMs = opts.retxAfterMs ?? DEFAULT_RETX_AFTER_MS
-    this.deadlineMs = opts.deadlineMs ?? 60_000
+    this.deadlineMs = opts.deadlineMs ?? Infinity
+    this.idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
+    if (!(this.idleMs > 0)) throw new Error("idle timeout must be > 0")
+    this.maxBackoffMs = Math.max(MAX_RETX_BACKOFF_MS, this.retxAfterMs)
+    this.congestion = this.window
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
     this.bindHost = opts.bindHost ?? "127.0.0.1"
     this.bindPort = opts.bindPort ?? 0
@@ -248,8 +268,10 @@ export class TeseraSender {
       placements: frames.map(() => null),
       sends: 1,
       nextRetxAt: Date.now() + this.retxAfterMs,
+      backoffMs: this.retxAfterMs,
       acked: false,
     }
+    if (this.inflight.size === 0) this.lastAckAt = Date.now()
     this.inflight.set(blockId, block)
     this.stats.blocks++
     this.stats.inputBytes += owned.length
@@ -293,11 +315,15 @@ export class TeseraSender {
       this.settleQuiet(block)
       block.acked = true
       this.opened = true
+      this.lastAckAt = Date.now()
+      this.congestion = Math.min(this.window, this.congestion + 1 / this.congestion)
       this.inflight.delete(frame.blockId)
       this.wake.notify()
       return
     }
     this.markProgress()
+    // A NACK may speed up the first repair. Later resends wait out the block's backoff.
+    if (block.sends > 1 && Date.now() < block.nextRetxAt) return
     const wanted = [...new Set(frame.missing)].filter((index) => index >= 0 && index < block.frames.length)
     const ripe = wanted.filter((index) => !this.placementHeld(block, index, performance.now()))
     if (ripe.length === 0) return
@@ -311,6 +337,10 @@ export class TeseraSender {
       return
     }
     const now = Date.now()
+    if (this.inflight.size > 0 && this.lastAckAt !== 0 && now - this.lastAckAt > this.idleMs) {
+      this.fail(new Error(`no block was acknowledged for ${Math.round(this.idleMs / 1000)}s`))
+      return
+    }
     const perfNow = performance.now()
     const stalled = this.stalled(perfNow)
     this.expireLossWatches(now)
@@ -375,7 +405,9 @@ export class TeseraSender {
       return
     }
     block.sends++
-    block.nextRetxAt = Date.now() + this.retxAfterMs
+    block.backoffMs = Math.min(this.maxBackoffMs, block.backoffMs * 2)
+    block.nextRetxAt = Date.now() + block.backoffMs
+    this.noteLoss(block.id)
     for (const index of indices) {
       if (this.stopped || block.acked) return
       const place = block.placements[index]
@@ -424,7 +456,20 @@ export class TeseraSender {
   }
 
   private openWindow(): number {
-    return this.opened ? this.window : 1
+    return this.opened ? Math.max(1, Math.floor(this.congestion)) : 1
+  }
+
+  /**
+   * A resend means a tessera, a sample, or an ACK went missing. That may be a
+   * full queue or an operator limit, or it may be random loss. Cut once per
+   * window, so one burst counts once, and never below MIN_WINDOW, so random
+   * loss cannot starve the transfer.
+   */
+  private noteLoss(blockId: number): void {
+    if (blockId < this.recoverFrom) return
+    this.recoverFrom = this.nextBlockId
+    const floor = Math.min(this.window, MIN_WINDOW)
+    this.congestion = Math.max(floor, this.congestion / 2)
   }
 
   private sampleKey(blockId: number, index: number): string {
