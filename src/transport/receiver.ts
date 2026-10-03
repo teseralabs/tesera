@@ -176,6 +176,8 @@ export class TeseraReceiver {
 
   private async onMessage(msg: Buffer, remote: Endpoint): Promise<void> {
     if (this.closed || this.error) return
+    // A data frame has no MAC and the first one picks the session id, so only relays may deliver.
+    if (!this.relayFor(remote)) return
     const frame = decodeFrame(msg, this.macKey)
     if (!frame || frame.kind !== "data") return
     if (this.sessionId && !this.sessionId.equals(frame.sessionId)) return
