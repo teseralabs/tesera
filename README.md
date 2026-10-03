@@ -1,4 +1,4 @@
-# tesera
+# ![](.github/mark.svg) tesera
 
 tesera is a new way for computers to send data to each other, even when parts of the network are slow, unreliable, or unavailable
 
