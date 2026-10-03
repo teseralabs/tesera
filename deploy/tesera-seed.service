@@ -1,0 +1,34 @@
+# sample unit for a seed relay that other relays join
+# this unit passes --access open, so any relay with an identity may join
+# --peers-file keeps joined relays across a restart
+# a relay started without --access open stays private, and the default caps stay on
+
+[Unit]
+Description=tesera seed relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tesera
+Group=tesera
+WorkingDirectory=/opt/tesera
+StateDirectory=tesera
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/tesera
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+Restart=on-failure
+RestartSec=15
+ExecStart=/usr/bin/node dist/src/cli.js relay --listen 0.0.0.0:4101 --allow-remote --access open --identity /var/lib/tesera/relay.secret --peers-file /var/lib/tesera/peers.json --policy-file /var/lib/tesera/policy.json --metrics-file /var/lib/tesera/metrics.json
+
+[Install]
+WantedBy=multi-user.target

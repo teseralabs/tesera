@@ -280,4 +280,18 @@ describe("cli", () => {
     assert.notEqual(code, 0)
     assert.match(proc.errors(), /--log-level/)
   })
+
+  it("rejects open access without an identity and keeps it for private relays", async () => {
+    const open = start(["relay", "--listen", "127.0.0.1:0", "--access", "open"])
+    assert.notEqual(await stopped(open), 0)
+    assert.match(open.errors(), /--access open needs --identity/)
+    assert.doesNotMatch(open.output(), /event=listen/)
+
+    const plain = start(["relay", "--listen", "127.0.0.1:0", "--access", "private"])
+    try {
+      await waitFor(plain, "role=relay event=listen", 3000)
+    } finally {
+      await stop(plain)
+    }
+  })
 })

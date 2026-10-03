@@ -1,6 +1,8 @@
-# sample unit for a public relay
-# this unit passes --access open
-# a relay started without that flag stays private, and the default caps stay on
+# sample unit for a public relay that joins the tesera bootstrap relay
+# --join pins the bootstrap relay's id, so a different key at that name is refused
+# the relay retries its first join for 60 seconds, then exits and systemd starts it again
+# once joined, it checks every minute that the bootstrap relay still lists it and joins again if not
+# add --advertise HOST:PORT to claim a public address in the signed record
 
 [Unit]
 Description=tesera relay
@@ -25,7 +27,9 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ExecStart=/usr/bin/node dist/src/cli.js relay --listen 0.0.0.0:4101 --allow-remote --access open --identity /var/lib/tesera/relay.secret --peers-file /var/lib/tesera/peers.json --policy-file /var/lib/tesera/policy.json --metrics-file /var/lib/tesera/metrics.json
+Restart=on-failure
+RestartSec=15
+ExecStart=/usr/bin/node dist/src/cli.js relay --listen 0.0.0.0:4101 --allow-remote --identity /var/lib/tesera/relay.secret --join relay:es36gsfwxo2mcrmzl2neokxl6svtc4oowkb3j5xhcjgnxxyzkykq@relay.tesera.net --metrics-file /var/lib/tesera/metrics.json
 
 [Install]
 WantedBy=multi-user.target

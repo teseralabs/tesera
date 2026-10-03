@@ -12,7 +12,7 @@ import {
   UNVERIFIED_DEST_TTL_MS,
 } from "../constants.js"
 import { allowsLog, formatLog, type LogLevel } from "../log.js"
-import { emptyRelayStats, type RelayStats } from "../metrics.js"
+import { emptyLimitedBy, emptyRelayStats, type LimitedBy, type RelayStats } from "../metrics.js"
 import {
   decodeProof,
   decodeQuery,
@@ -60,7 +60,7 @@ import { readAnalytics, writeAnalytics } from "./analytics.js"
 import { readPeers, writePeers, type StoredPeer } from "./peers-file.js"
 import { DestBudget } from "./dest-budget.js"
 import { destinationAllowed, parseCidr, type Cidr } from "./dest.js"
-import { fillPolicy, PolicyGate, readPolicy, writePolicy, type OperatorPolicy } from "./policy.js"
+import { fillPolicy, PolicyGate, readPolicy, writePolicy, type LimitReason, type OperatorPolicy } from "./policy.js"
 import { isStructuralTesera } from "./structural.js"
 import { DEFAULT_PEER_OFFLINE_MS, defaultRelaySettings, type RelaySettings } from "./config.js"
 import { CorrelatedGate, fillAdversity, PathSim, type Admit, type Adversity } from "../sim/network.js"
@@ -110,6 +110,46 @@ export type RelayOptions = {
   recordTtlSec?: number
   /** Last signed record. A restart reads this so the sequence does not go backward. */
   recordFile?: string
+  /** Shortest gap between `event=limited` lines. Defaults to 30 seconds. */
+  limitLogMs?: number
+}
+
+/** Shortest gap between two `event=limited` lines. */
+const LIMIT_LOG_MS = 30_000
+/** How long a relay keeps trying its first join before it gives up. */
+export const JOIN_STARTUP_MS = 60_000
+const JOIN_RETRY_MAX_MS = 15_000
+/** How often a joined relay reads the seed's signed table to see that it is still listed. */
+export const MEMBERSHIP_CHECK_MS = 60_000
+/** Longest gap between checks while the seed does not answer. */
+export const MEMBERSHIP_CHECK_MAX_MS = 300_000
+
+/** The seed to join. `resolve` runs before every join, so a changed address is picked up. */
+export type JoinTarget = {
+  label: string
+  id: string | null
+  resolve: () => Promise<Endpoint>
+}
+
+export type StayJoinedOptions = {
+  startupMs?: number
+  attemptMs?: number
+  firstRetryMs?: number
+  checkMs?: number
+  maxCheckMs?: number
+}
+
+/** The seed signed its table with a key other than the pinned one. Retrying does not help. */
+export class PinnedSeedError extends Error {
+  constructor(seed: Endpoint, got: string, pinned: string) {
+    super(`seed ${seed.host}:${seed.port} is ${got}, not the pinned ${pinned}`)
+  }
+}
+
+class JoinError extends Error {
+  constructor(seed: Endpoint, readonly why: string) {
+    super(`relay did not join ${seed.host}:${seed.port}: ${why}`)
+  }
 }
 
 export class Relay {
@@ -161,6 +201,14 @@ export class Relay {
   private readonly recordFile: string | null
   private recordPacket: Buffer | null = null
   private recordTimer: NodeJS.Timeout | null = null
+  private limitTimer: NodeJS.Timeout | null = null
+  private joinTarget: JoinTarget | null = null
+  private joinCheckMs = MEMBERSHIP_CHECK_MS
+  private joinMaxCheckMs = MEMBERSHIP_CHECK_MAX_MS
+  private joinAttemptMs = 1500
+  private joinBackoffMs = 0
+  private membershipTimer: NodeJS.Timeout | null = null
+  private limitsLogged: LimitedBy = emptyLimitedBy()
   readonly stats: RelayStats = emptyRelayStats()
   /** Test hook. Called with the inner frame of packets that are actually forwarded. */
   onForward: ((inner: Buffer) => void) | null = null
@@ -227,6 +275,9 @@ export class Relay {
     const peerTimer = setInterval(() => this.sweepPeers(), 5000)
     peerTimer.unref()
     this.peerTimer = peerTimer
+    const limitTimer = setInterval(() => this.reportLimits(), this.opts.limitLogMs ?? LIMIT_LOG_MS)
+    limitTimer.unref()
+    this.limitTimer = limitTimer
     try {
       await this.openRecord()
       await this.openAnalytics()
@@ -245,20 +296,111 @@ export class Relay {
    * The seed records the source address of that proof, which is the address
    * other peers will be told to use.
    */
-  async join(seed: Endpoint, timeoutMs = 1500): Promise<void> {
+  async join(seed: Endpoint, timeoutMs = 1500, pinned: string | null = null): Promise<string> {
     if (!this.identity || !this.socket || !this.bound) throw new Error("relay has not started")
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("join timeout must be >= 0")
     const started = Date.now()
+    let answered = false
     while (Date.now() - started <= timeoutMs) {
+      if (this.closed || !this.socket) break
       await sendUdp(this.socket, encodeJoin(), seed)
       const table = await readRelayTable(seed, { timeoutMs: 200, attempts: 1 }).catch(() => null)
+      if (table && pinned && table.id !== pinned) throw new PinnedSeedError(seed, table.id, pinned)
       if (table?.peers.some((peer) => peer.id === this.identity?.id)) {
         this.armUsage(seed)
-        return
+        return table.id
       }
+      if (table) answered = true
       await sleep(30)
     }
-    throw new Error(`relay did not join ${seed.host}:${seed.port}`)
+    throw new JoinError(seed, answered ? "the seed answered but did not list this relay" : "the seed did not answer")
+  }
+
+  /**
+   * Join at startup, retrying with backoff, then keep checking that the seed
+   * still lists this relay. The seed's signed peer table is the check, so a
+   * seed that restarted or forgot this relay is joined again. Each new join
+   * looks the seed's name up again. Throws only when the startup window ends
+   * without a join, or when a pinned seed answers with a different id.
+   */
+  async stayJoined(target: JoinTarget, opts: StayJoinedOptions = {}): Promise<void> {
+    const startupMs = opts.startupMs ?? JOIN_STARTUP_MS
+    const attemptMs = opts.attemptMs ?? 1500
+    const started = Date.now()
+    let delay = opts.firstRetryMs ?? 1000
+    let lastError: Error | null = null
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.joinOnce(target, attemptMs)
+        break
+      } catch (err) {
+        if (err instanceof PinnedSeedError) throw err
+        lastError = err instanceof Error ? err : new Error(String(err))
+        this.emit("error", "error", { reason: "join", addr: target.label, attempt })
+      }
+      if (this.closed) throw new Error("relay closed")
+      if (Date.now() - started + delay > startupMs) {
+        const seconds = Math.round(startupMs / 1000)
+        const why = lastError instanceof JoinError ? lastError.why : lastError.message
+        throw new Error(`relay did not join ${target.label} within ${seconds}s: ${why}`)
+      }
+      await sleep(delay)
+      delay = Math.min(delay * 2, JOIN_RETRY_MAX_MS)
+    }
+    this.joinTarget = target
+    this.joinCheckMs = opts.checkMs ?? MEMBERSHIP_CHECK_MS
+    this.joinMaxCheckMs = opts.maxCheckMs ?? MEMBERSHIP_CHECK_MAX_MS
+    this.joinAttemptMs = attemptMs
+    this.scheduleMembership(this.joinCheckMs)
+  }
+
+  private async joinOnce(target: JoinTarget, attemptMs: number): Promise<void> {
+    const seed = await target.resolve()
+    const id = await this.join(seed, attemptMs, target.id)
+    this.emit("info", "joined", { addr: `${seed.host}:${seed.port}`, seed: id })
+  }
+
+  private scheduleMembership(waitMs: number): void {
+    if (this.closed) return
+    if (this.membershipTimer) clearTimeout(this.membershipTimer)
+    const timer = setTimeout(() => {
+      this.membershipTimer = null
+      void this.checkMembership().then((next) => this.scheduleMembership(next))
+    }, waitMs)
+    timer.unref()
+    this.membershipTimer = timer
+  }
+
+  /** Returns the wait before the next check. A missing seed doubles it, up to the cap. */
+  private async checkMembership(): Promise<number> {
+    const target = this.joinTarget
+    const seed = this.seedEndpoint
+    if (!target || !seed || this.closed || !this.identity) return this.joinCheckMs
+    const table = await readRelayTable(seed, { timeoutMs: 500, attempts: 3 }).catch(() => null)
+    if (this.closed) return this.joinCheckMs
+    if (table && target.id && table.id !== target.id) {
+      this.emit("error", "error", { reason: "pinned", addr: `${seed.host}:${seed.port}`, seed: table.id })
+      return this.backoffCheck()
+    }
+    if (table?.peers.some((peer) => peer.id === this.identity?.id)) {
+      this.joinBackoffMs = 0
+      return this.joinCheckMs
+    }
+    this.emit("info", "rejoin", { addr: target.label, reason: table ? "missing" : "unreachable" })
+    try {
+      await this.joinOnce(target, this.joinAttemptMs)
+      this.joinBackoffMs = 0
+      return this.joinCheckMs
+    } catch (err) {
+      const reason = err instanceof PinnedSeedError ? "pinned" : "join"
+      this.emit("error", "error", { reason, addr: target.label })
+      return this.backoffCheck()
+    }
+  }
+
+  private backoffCheck(): number {
+    this.joinBackoffMs = Math.min(this.joinMaxCheckMs, Math.max(this.joinCheckMs, this.joinBackoffMs * 2))
+    return this.joinBackoffMs
   }
 
   /** Tell the seed how many bytes this relay has forwarded. */
@@ -337,7 +479,28 @@ export class Relay {
       denied: this.stats.droppedDenied,
       invalid: this.stats.droppedInvalid,
       limited: this.stats.droppedLimited,
+      limitedBy: { ...this.stats.limitedBy },
     }
+  }
+
+  private limit(reason: LimitReason): void {
+    this.stats.droppedLimited++
+    this.stats.limitedBy[reason]++
+  }
+
+  /** One line per interval while a cap is dropping, with the drops since the last line. */
+  private reportLimits(): void {
+    const now = this.stats.limitedBy
+    const last = this.limitsLogged
+    const fields: Record<string, number> = {}
+    let total = 0
+    for (const reason of Object.keys(now) as LimitReason[]) {
+      const delta = now[reason] - last[reason]
+      fields[reason] = delta
+      total += delta
+    }
+    this.limitsLogged = { ...now }
+    if (total > 0) this.emit("info", "limited", fields)
   }
 
   async close(): Promise<void> {
@@ -355,6 +518,10 @@ export class Relay {
     this.policyTimer = null
     if (this.recordTimer) clearInterval(this.recordTimer)
     this.recordTimer = null
+    if (this.limitTimer) clearInterval(this.limitTimer)
+    this.limitTimer = null
+    if (this.membershipTimer) clearTimeout(this.membershipTimer)
+    this.membershipTimer = null
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
     await this.flushAnalytics()
@@ -408,12 +575,13 @@ export class Relay {
       return
     }
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
-    if (this.gate && !this.gate.admitDatagram(msg.length, session)) {
-      this.stats.droppedLimited++
+    const limited = this.gate?.admitDatagram(msg.length, session) ?? null
+    if (limited) {
+      this.limit(limited)
       return
     }
     if (this.opts.allowRemote && !this.dests.spend(env.dest, env.inner.length)) {
-      this.stats.droppedLimited++
+      this.limit("destination")
       return
     }
     const socket = this.socket
@@ -540,8 +708,9 @@ export class Relay {
   /** Identity replies share the datagram and bandwidth budgets. The peer table waits for a second packet. */
   private sendIdentity(packet: Buffer, to: Endpoint): boolean {
     if (!this.socket) return false
-    if (this.gate && !this.gate.admitDatagram(packet.length, null)) {
-      this.stats.droppedLimited++
+    const limited = this.gate?.admitDatagram(packet.length, null) ?? null
+    if (limited) {
+      this.limit(limited)
       return false
     }
     this.socket.send(packet, to.port, to.host)
@@ -567,7 +736,7 @@ export class Relay {
       return
     }
     if (this.tableAsked.size >= TABLE_PENDING_MAX && !this.tableAsked.has(key)) {
-      this.stats.droppedLimited++
+      this.limit("table")
       return
     }
     const issued = randomBytes(16)

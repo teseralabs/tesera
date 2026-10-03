@@ -1,5 +1,6 @@
 import { createServer, type Server, type ServerResponse } from "node:http"
 import type { Endpoint } from "../carrier/udp.js"
+import type { LimitedBy } from "../metrics.js"
 import type { RecordDocument } from "../identity/record.js"
 import type { RelaySnapshot } from "../identity/stats.js"
 
@@ -15,6 +16,7 @@ export type RelayReport = {
   denied: number
   invalid: number
   limited: number
+  limitedBy: LimitedBy
 }
 
 /** One relay this seed knows. `seen` is milliseconds since the epoch. */

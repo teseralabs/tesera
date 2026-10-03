@@ -6,8 +6,27 @@ export type RelayStats = {
   droppedBlackhole: number
   droppedDenied: number
   droppedInvalid: number
-  /** Dropped because an operator cap was already full. */
+  /** Dropped because an operator cap was already full. The sum of `limitedBy`. */
   droppedLimited: number
+  limitedBy: LimitedBy
+}
+
+/** Drops by the cap that was full. */
+export type LimitedBy = {
+  /** `--max-sessions` was full and this was a new session. */
+  session: number
+  /** `--datagram-rate` was spent. */
+  datagram: number
+  /** `--bandwidth` was spent. */
+  bandwidth: number
+  /** A destination that has not replied used up its allowance. */
+  destination: number
+  /** Too many peer-table lookups were waiting for their second packet. */
+  table: number
+}
+
+export function emptyLimitedBy(): LimitedBy {
+  return { session: 0, datagram: 0, bandwidth: 0, destination: 0, table: 0 }
 }
 
 export function emptyRelayStats(): RelayStats {
@@ -19,6 +38,7 @@ export function emptyRelayStats(): RelayStats {
     droppedDenied: 0,
     droppedInvalid: 0,
     droppedLimited: 0,
+    limitedBy: emptyLimitedBy(),
   }
 }
 

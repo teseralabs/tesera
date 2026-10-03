@@ -1,12 +1,18 @@
 import { type Socket } from "node:dgram"
 import { bindUdp, closeUdp, createUdpSocket, sendUdp, type Endpoint } from "../carrier/udp.js"
 import { decodeShards, joinShards } from "../coding/reedsolomon.js"
-import { DEFAULT_NACK_AFTER_MS, DEFAULT_TICK_MS, MAX_AHEAD } from "../constants.js"
+import {
+  DEFAULT_ACK_GRACE_MS,
+  DEFAULT_NACK_AFTER_MS,
+  DEFAULT_TICK_MS,
+  MAX_AHEAD,
+  MAX_RETX_BACKOFF_MS,
+} from "../constants.js"
 import { assertSession, blockAad, deriveKeys, open } from "../crypto/session.js"
 import { emptyReceiverStats, type ReceiverStats } from "../metrics.js"
 import { encodeEnvelope } from "../protocol/envelope.js"
 import { decodeFrame, encodeAck, encodeNack, encodeSample, type DataFrame } from "../protocol/frames.js"
-import { asError, Signal } from "../util.js"
+import { asError, Signal, sleep } from "../util.js"
 
 type PartialBlock = {
   k: number
@@ -55,6 +61,8 @@ export class TeseraReceiver {
   private readonly decoded = new Set<number>()
   /** Delivered block ids that may still be acknowledged. Bounded by the receive window. */
   private readonly ackable = new Set<number>()
+  /** When each incomplete block may be NACKed again. */
+  private readonly nackPace = new Map<number, { nextAt: number; waitMs: number }>()
   private settledMissing = 0
   private settledPartial = 0
   private readonly chunks: Buffer[] = []
@@ -118,6 +126,15 @@ export class TeseraReceiver {
       if (this.streamEnded && this.ready.size === 0) return null
       await this.readWake.wait()
     }
+  }
+
+  /**
+   * Keep answering after the last block. The sender may still be waiting for
+   * an ACK that was lost, and only a repeat from it can tell us so.
+   */
+  async linger(graceMs = DEFAULT_ACK_GRACE_MS): Promise<void> {
+    if (!this.streamEnded || this.error || this.closed) return
+    await sleep(graceMs)
   }
 
   fail(err: unknown): void {
@@ -343,8 +360,11 @@ export class TeseraReceiver {
   private async nackTick(): Promise<void> {
     if (this.stopped || !this.sender || this.n === 0) return
     const now = Date.now()
+    for (const id of this.nackPace.keys()) {
+      if (!this.partials.has(id) && !this.missingSince.has(id)) this.nackPace.delete(id)
+    }
     for (const [id, partial] of this.partials) {
-      if (now - partial.firstSeen < this.nackAfterMs) continue
+      if (now - partial.firstSeen < this.nackAfterMs || !this.nackDue(id, now)) continue
       const missing: number[] = []
       for (let index = 0; index < partial.n; index++) {
         if (!partial.shards.has(index)) missing.push(index)
@@ -356,11 +376,24 @@ export class TeseraReceiver {
         this.missingSince.delete(id)
         continue
       }
-      if (now - since < this.nackAfterMs || this.n === 0) continue
+      if (now - since < this.nackAfterMs || this.n === 0 || !this.nackDue(id, now)) continue
       const missing: number[] = []
       for (let index = 0; index < this.n; index++) missing.push(index)
       await this.sendNack(id, missing)
     }
+  }
+
+  /**
+   * One block's NACKs back off like the sender's resends. A NACK goes through
+   * every relay, so repeating it on every tick would spend the relays' caps on
+   * requests instead of the tesserae being asked for.
+   */
+  private nackDue(id: number, now: number): boolean {
+    const pace = this.nackPace.get(id)
+    if (pace && now < pace.nextAt) return false
+    const waitMs = pace ? Math.min(MAX_RETX_BACKOFF_MS, pace.waitMs * 2) : this.nackAfterMs
+    this.nackPace.set(id, { nextAt: now + waitMs, waitMs })
+    return true
   }
 
   private async sendSample(blockId: number, tesseraIndex: number, remote: Endpoint): Promise<void> {

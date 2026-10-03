@@ -48,6 +48,8 @@ type DiscoverOptions = {
   attempts?: number
   confirmTimeoutMs?: number
   confirmAttempts?: number
+  /** The seed's relay id. A table signed by any other key is refused. */
+  pinned?: string | null
 }
 
 export function encodeJoin(): Buffer {
@@ -157,6 +159,9 @@ export function decodeTable(packet: Uint8Array): RelayTable | null {
  */
 export async function discoverRelays(seed: Endpoint, opts: DiscoverOptions = {}): Promise<IntroducedRelay[]> {
   const table = await readRelayTable(seed, opts)
+  if (opts.pinned && table.id !== opts.pinned) {
+    throw new Error(`seed ${seed.host}:${seed.port} is ${table.id}, not the pinned ${opts.pinned}`)
+  }
   await confirmRelay(seed, table.id, {
     timeoutMs: opts.confirmTimeoutMs ?? 500,
     attempts: opts.confirmAttempts ?? 3,
