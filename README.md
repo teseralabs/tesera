@@ -1,4 +1,10 @@
-# ![](.github/mark.svg) tesera
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/mark-white.svg" />
+    <img src=".github/mark.svg" alt="" width="28" height="28" />
+  </picture>
+  tesera
+</h1>
 
 tesera is a new way for computers to send data to each other, even when parts of the network are slow, unreliable, or unavailable
 
