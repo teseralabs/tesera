@@ -451,7 +451,7 @@ a quiet relay stays in that list and is marked offline. `seen` is milliseconds s
     "ttl": 86400,
     "wire": 2,
     "implementation": "tesera",
-    "software": "0.2.0-beta",
+    "software": "0.2.1-beta",
     "build": "",
     "manifest": "",
     "capabilities": ["discover", "forward"],
