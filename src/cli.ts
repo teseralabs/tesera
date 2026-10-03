@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
 import { open, readFile, writeFile } from "node:fs/promises"
 import { resolve } from "node:path"
+import { parsePortRange } from "./carrier/ports.js"
 import { DEFAULT_RELAY_PORT, resolveEndpoint, resolveRelayRef, splitRelayRef } from "./carrier/resolve.js"
 import { listenPublicApi } from "./api/public.js"
 import { isLoopback, normalizeHost, parseEndpoint, parseListen, type Endpoint } from "./carrier/udp.js"
@@ -36,7 +37,7 @@ tesera allow RELAY --policy-file FILE
 tesera block RELAY --policy-file FILE
 tesera unblock RELAY --policy-file FILE
 tesera forget RELAY --policy-file FILE
-tesera api --listen 127.0.0.1:4190 [--discover [relay:ID@]relay.tesera.net] [--advertise 127.0.0.1] [--trust-proxy ADDR] [--log-level info]
+tesera api --listen 127.0.0.1:4190 [--discover [relay:ID@]relay.tesera.net] [--advertise 127.0.0.1] [--udp-ports LOW-HIGH] [--prefer-joined] [--trust-proxy ADDR] [--log-level info]
 tesera recv --listen 0.0.0.0:4200 --sender HOST:4300 --discover [relay:ID@]relay.tesera.net --session SESSION --output FILE
 tesera send --listen 0.0.0.0:4300 --receiver HOST:4200 --discover [relay:ID@]relay.tesera.net --session SESSION --input FILE
 tesera stats --via relay.tesera.net [--json]
@@ -434,12 +435,19 @@ async function runApi(argv: string[]): Promise<void> {
   const flags = parseFlags(argv)
   const listen = parseListen(requiredString(flags, "listen"))
   const logLevel = parseLogLevel(optionalString(flags, "log-level") ?? "info")
-  const discover = await resolveRelayRef(optionalString(flags, "discover") ?? "relay.tesera.net")
   const advertise = normalizeHost(optionalString(flags, "advertise") ?? "127.0.0.1")
+  const udpPorts = optionalString(flags, "udp-ports")
+  const ports = udpPorts ? parsePortRange(udpPorts) : null
+  if (flagOn(flags, "prefer-joined") && isLoopback(advertise)) {
+    throw new Error("--prefer-joined needs --advertise with an address joined relays can reach")
+  }
+  const discover = await resolveRelayRef(optionalString(flags, "discover") ?? "relay.tesera.net")
   const api = await listenPublicApi(listen.host, listen.port, {
     discover: discover.endpoint,
     discoverId: discover.id,
     advertise,
+    ports,
+    preferJoined: flagOn(flags, "prefer-joined"),
     trustProxy: repeated(argv, "trust-proxy"),
     log: (event, fields) => {
       emit(event === "error" ? "error" : "info", logLevel, "api", event, fields)

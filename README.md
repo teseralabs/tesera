@@ -551,6 +551,10 @@ npm run tesera -- api \
 
 `--advertise` is the IPv4 address relays use to send data back to this tesera instance. when relays are running on other machines, this needs to be an address they can reach
 
+`--udp-ports` keeps the API's UDP sockets inside one range, such as `4400-4463`, so a firewall only needs to open that range. each transfer uses 2 ports. without it each socket takes a random port. a transfer that finds no free port gets `503 busy`
+
+`--prefer-joined` is for an API on the same machine as its `--discover` seed. a call that names no relays uses up to 3 relays that joined the seed, different hosts first, when 2 or more answer. if that fails, it tries once more through the seed alone with what is left of the deadline. with fewer than 2 joined relays it uses the seed. it needs an `--advertise` address the joined relays can reach
+
 if other programs or computers need to use the API, the listen address can be published somewhere reachable, for example `api.tesera.net`
 
 `--trust-proxy` names a loopback reverse proxy on this machine, such as `127.0.0.1`. a request may take its client address from `X-Forwarded-For` only when the socket peer is that proxy. the address used is the rightmost hop that is not itself a trusted proxy

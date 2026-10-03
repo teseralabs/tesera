@@ -151,13 +151,10 @@ describe("per-sender keys", () => {
       cipherLen: sealedLength(body.length),
       payload: Buffer.from(frame.subarray(DATA_HEADER_LEN, frame.length - 4)),
     })
-    const receiver = new TeseraReceiver({
-      session: secret,
-      relays: [{ host: "127.0.0.1", port: 9 }],
-    })
     const socket = createUdpSocket()
+    const relay = await bindUdp(socket, "127.0.0.1", 0)
+    const receiver = new TeseraReceiver({ session: secret, relays: [relay] })
     const boundRx = await receiver.start()
-    await bindUdp(socket, "127.0.0.1", 0)
     try {
       await sendUdp(socket, forged, boundRx)
       await assert.rejects(receiver.read(), /integrity check/)
@@ -165,6 +162,29 @@ describe("per-sender keys", () => {
     } finally {
       await receiver.close()
       await closeUdp(socket)
+    }
+  })
+
+  it("ignores a data frame that does not come from one of its relays", async () => {
+    const secret = randomBytes(32)
+    const sessionId = randomBytes(16)
+    const body = Buffer.from("from a relay")
+    const relaySocket = createUdpSocket()
+    const strangerSocket = createUdpSocket()
+    const relay = await bindUdp(relaySocket, "127.0.0.1", 0)
+    await bindUdp(strangerSocket, "127.0.0.1", 0)
+    const receiver = new TeseraReceiver({ session: secret, relays: [relay], sender: relay })
+    const boundRx = await receiver.start()
+    try {
+      await sendUdp(strangerSocket, dataFrame(secret, randomBytes(16), 0, Buffer.from("stranger"), true), boundRx)
+      await sleep(50)
+      await sendUdp(relaySocket, dataFrame(secret, sessionId, 0, body, true), boundRx)
+      assert.deepEqual(await receiver.read(), body)
+      assert.equal(await receiver.read(), null)
+    } finally {
+      await receiver.close()
+      await closeUdp(relaySocket)
+      await closeUdp(strangerSocket)
     }
   })
 })

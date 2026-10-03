@@ -181,6 +181,49 @@ export async function discoverRelays(seed: Endpoint, opts: DiscoverOptions = {})
   return [{ id: table.id, endpoint: { host: seed.host, port: seed.port } }, ...peers]
 }
 
+/** Most joined relays one transfer uses when it leaves the seed out. */
+export const JOINED_PICK = 3
+
+/**
+ * Relays for a sender and receiver on the seed's own machine. The seed's
+ * round trip is near zero there, so the scheduler would keep every block on
+ * it. With 2 or more joined relays, use up to 3 of them, different hosts
+ * first, and keep the seed for a retry. Otherwise use the seed alone.
+ * `found` is `discoverRelays` output: the seed first, then relays that proved their key.
+ */
+export function preferJoined(
+  found: readonly Endpoint[],
+  random: () => number = Math.random,
+): { relays: Endpoint[]; fallback: Endpoint[] | null } {
+  const [seed, ...joined] = found
+  if (!seed) throw new Error("no relays")
+  const order = shuffled(joined, random)
+  const hosts = new Set<string>()
+  const picked: Endpoint[] = []
+  for (const relay of order) {
+    if (picked.length >= JOINED_PICK || hosts.has(relay.host)) continue
+    hosts.add(relay.host)
+    picked.push(relay)
+  }
+  for (const relay of order) {
+    if (picked.length >= JOINED_PICK) break
+    if (!picked.includes(relay)) picked.push(relay)
+  }
+  if (picked.length < 2) return { relays: [seed], fallback: null }
+  return { relays: picked, fallback: [seed] }
+}
+
+function shuffled<T>(items: readonly T[], random: () => number): T[] {
+  const out = [...items]
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1))
+    const swap = out[i] as T
+    out[i] = out[j] as T
+    out[j] = swap
+  }
+  return out
+}
+
 export async function readRelayTable(seed: Endpoint, opts: DiscoverOptions = {}): Promise<RelayTable> {
   const attempts = opts.attempts ?? 3
   const timeoutMs = opts.timeoutMs ?? 300

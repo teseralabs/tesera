@@ -4,6 +4,7 @@
 
 import { createHash } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
+import { PortPool, startOnPort, type PortRange } from "../carrier/ports.js"
 import { resolveRelayRef } from "../carrier/resolve.js"
 import { isLoopback, normalizeHost, type Endpoint } from "../carrier/udp.js"
 import {
@@ -20,7 +21,7 @@ import {
 } from "../constants.js"
 import { parseSession } from "../crypto/session.js"
 import { confirmRelay } from "../identity/confirm.js"
-import { discoverRelays } from "../identity/peers.js"
+import { discoverRelays, preferJoined } from "../identity/peers.js"
 import { ApiLimiter, DEFAULT_API_LIMITS, clientAddress, trustedProxies, type ApiLimitConfig, type LimitResult } from "./limit.js"
 import { SOFTWARE_VERSION, fetchRelayRecord, recordDocument } from "../identity/record.js"
 import { readRelaySnapshot } from "../identity/stats.js"
@@ -40,6 +41,10 @@ export const API_KEEPALIVE_TIMEOUT_MS = 5_000
 export const API_MAX_HEADER_BYTES = 16 * 1024
 const DEFAULT_DEADLINE_MS = 60_000
 const DOCS_URL = "https://tesera.net/api.html"
+/** How long the default seed's confirmed relays are reused when `preferJoined` is on. */
+const SEED_RELAYS_MS = 30_000
+/** A retry through the seed alone needs at least this much of the deadline left. */
+const MIN_RETRY_MS = 1_000
 
 export class ApiError extends Error {
   logged = false
@@ -60,6 +65,13 @@ export type PublicApiOptions = {
   discoverId?: string | null
   /** Address relays can send back to. Loopback binds there. Any other address binds all interfaces. */
   advertise: string
+  /** UDP ports for transfer sockets. Unset binds a random port. */
+  ports?: PortRange | null
+  /**
+   * Calls on the default seed use the relays joined to it and keep the seed
+   * for one retry. For a seed on this machine, which would otherwise carry every block.
+   */
+  preferJoined?: boolean
   maxBytes?: number
   maxPairs?: number
   /** Socket addresses allowed to supply the client through X-Forwarded-For. */
@@ -88,6 +100,8 @@ type Arrival = {
   session: Buffer
   relays: Endpoint[]
   relayKey: string
+  /** The call named no relays and no seed, so it used the default seed. */
+  seedDefault: boolean
   payload: Buffer | null
   deadlineAt: number
   coding: Coding
@@ -138,6 +152,8 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
   const maxPairs = opts.maxPairs ?? MAX_API_PAIRS
   const slots = new Map<string, Slot>()
   const log = opts.log ?? (() => {})
+  const pool = opts.ports ? new PortPool(opts.ports) : null
+  let seedCache: { at: number; relays: Endpoint[] } | null = null
 
   const trusted = trustedProxies(opts.trustProxy ?? [])
   const limiter = new ApiLimiter({ ...DEFAULT_API_LIMITS, ...opts.limits })
@@ -254,12 +270,13 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
       const payload = side === "send" ? await readBody(req, maxBytes) : await drain(req, maxBytes)
       if (side === "send" && payload.length === 0) throw new ApiError(400, "empty")
       if (side === "send") admit(limiter.addBytes(ip, payload.length))
-      const relays = await resolveCallRelays(req, opts.discover, opts.discoverId ?? null)
+      const { relays, seedDefault } = await resolveCallRelays(req, seedRelays)
       const outcome = await enter(sessionKey(session), {
         side,
         session,
         relays,
         relayKey: relayKey(relays),
+        seedDefault,
         payload: side === "send" ? payload : null,
         deadlineAt,
         coding,
@@ -361,14 +378,37 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
     else arrival.abort.addEventListener("abort", stop, { once: true })
   }
 
+  /** The default seed's confirmed relays, seed first. Reused briefly when `preferJoined` is on. */
+  async function seedRelays(): Promise<Endpoint[]> {
+    const now = Date.now()
+    if (opts.preferJoined && seedCache && now - seedCache.at < SEED_RELAYS_MS) return seedCache.relays
+    const found = await discoverRelays(opts.discover, { pinned: opts.discoverId ?? null })
+    const relays = found.map((relay) => relay.endpoint)
+    if (opts.preferJoined) seedCache = { at: now, relays }
+    return relays
+  }
+
   async function run(slot: Slot): Promise<void> {
     const send = slot.first.side === "send" ? slot.first : slot.second
     const receive = slot.first.side === "receive" ? slot.first : slot.second
     if (!send?.payload || !receive) throw new ApiError(502, "transfer")
-    const left = Math.min(send.deadlineAt, receive.deadlineAt) - Date.now()
+    const deadlineAt = Math.min(send.deadlineAt, receive.deadlineAt)
+    const left = deadlineAt - Date.now()
     if (left < 1) throw new ApiError(408, "timeout")
+    const plan =
+      opts.preferJoined && send.seedDefault ? preferJoined(send.relays) : { relays: send.relays, fallback: null }
     try {
-      const outcome = await move(slot, send, receive, advertise, left)
+      let outcome: Outcome
+      try {
+        const firstMs = plan.fallback ? Math.ceil(left / 2) : left
+        outcome = await move(slot, send, receive, advertise, firstMs, plan.relays, pool)
+      } catch (err) {
+        const rest = deadlineAt - Date.now()
+        if (!plan.fallback || slot.settled || err instanceof ApiError || rest < MIN_RETRY_MS) throw err
+        const timedOut = asError(err).message === "transfer timed out"
+        log("retry", { relays: plan.relays.length, reason: timedOut ? "timeout" : "transfer" })
+        outcome = await move(slot, send, receive, advertise, rest, plan.fallback, pool)
+      }
       if (slot.settled) return
       log("send", {
         bytes: outcome.bytes.length,
@@ -392,19 +432,27 @@ async function move(
   receive: Arrival,
   advertise: string,
   deadlineMs: number,
+  relays: Endpoint[],
+  pool: PortPool | null,
 ): Promise<Outcome> {
   const payload = send.payload
   if (!payload) throw new ApiError(502, "transfer")
   const bindHost = isLoopback(advertise) ? advertise : "0.0.0.0"
-  const relays = send.relays
-  const receiver = new TeseraReceiver({
-    session: send.session,
-    relays,
-    bindHost,
-    bindPort: 0,
-    nackAfterMs: receive.coding.nackAfterMs,
-  })
+  const rx = await startOnPort(
+    pool,
+    (port) =>
+      new TeseraReceiver({
+        session: send.session,
+        relays,
+        bindHost,
+        bindPort: port,
+        nackAfterMs: receive.coding.nackAfterMs,
+      }),
+  )
+  if (!rx) throw new ApiError(503, "busy")
+  const receiver = rx.item
   let sender: TeseraSender | undefined
+  let txPort: number | null = null
   slot.cancel = () => {
     sender?.fail(new Error("closed"))
     receiver.fail(new Error("closed"))
@@ -415,22 +463,29 @@ async function move(
     return Buffer.alloc(0)
   })
   try {
-    const boundRx = await receiver.start()
-    sender = new TeseraSender({
-      session: send.session,
-      relays,
-      receiver: { host: advertise, port: boundRx.port },
-      bindHost,
-      bindPort: 0,
-      k: send.coding.k,
-      n: send.coding.n,
-      shardSize: send.coding.shardSize,
-      window: send.coding.window,
-      maxSends: send.coding.maxSends,
-      retxAfterMs: send.coding.retxAfterMs,
-      deadlineMs,
-    })
-    const boundTx = await sender.start()
+    const boundRx = receiver.endpoint
+    const tx = await startOnPort(
+      pool,
+      (port) =>
+        new TeseraSender({
+          session: send.session,
+          relays,
+          receiver: { host: advertise, port: boundRx.port },
+          bindHost,
+          bindPort: port,
+          k: send.coding.k,
+          n: send.coding.n,
+          shardSize: send.coding.shardSize,
+          window: send.coding.window,
+          maxSends: send.coding.maxSends,
+          retxAfterMs: send.coding.retxAfterMs,
+          deadlineMs,
+        }),
+    )
+    if (!tx) throw new ApiError(503, "busy")
+    sender = tx.item
+    txPort = tx.port
+    const boundTx = sender.endpoint
     receiver.setSender({ host: advertise, port: boundTx.port })
     sender.onPeerFail = (err) => receiver.fail(err)
     receiver.onPeerFail = (err) => sender?.fail(err)
@@ -451,6 +506,8 @@ async function move(
     await sender?.close()
     await receiver.close()
     await reading.catch(() => {})
+    if (pool && rx.port !== null) pool.release(rx.port)
+    if (pool && txPort !== null) pool.release(txPort)
   }
 }
 
@@ -496,16 +553,24 @@ function readCoding(req: IncomingMessage): Coding {
   return { k, n, shardSize, window, maxSends, retxAfterMs, nackAfterMs }
 }
 
-async function resolveCallRelays(req: IncomingMessage, fallback: Endpoint, fallbackId: string | null): Promise<Endpoint[]> {
+async function resolveCallRelays(
+  req: IncomingMessage,
+  seedRelays: () => Promise<Endpoint[]>,
+): Promise<{ relays: Endpoint[]; seedDefault: boolean }> {
   const listed = headerText(req, "x-tesera-relays")
   const discover = headerText(req, "x-tesera-discover")
   if (listed !== undefined && discover !== undefined) throw new ApiError(400, "option")
   try {
-    if (listed !== undefined) return await listedRelays(listed)
-    const ref = discover !== undefined ? await resolveRelayRef(discover) : { id: fallbackId, endpoint: fallback }
+    if (listed !== undefined) return { relays: await listedRelays(listed), seedDefault: false }
+    if (discover === undefined) {
+      const relays = await seedRelays()
+      if (relays.length < 1) throw new ApiError(400, "relays")
+      return { relays, seedDefault: true }
+    }
+    const ref = await resolveRelayRef(discover)
     const found = await discoverRelays(ref.endpoint, { pinned: ref.id })
     if (found.length < 1) throw new ApiError(400, "relays")
-    return found.map((relay) => relay.endpoint)
+    return { relays: found.map((relay) => relay.endpoint), seedDefault: false }
   } catch (err) {
     if (err instanceof ApiError) throw err
     throw new ApiError(400, "relays")

@@ -281,6 +281,16 @@ describe("cli", () => {
     assert.match(proc.errors(), /--log-level/)
   })
 
+  it("refuses joined relays for a loopback api and a bad udp port range", async () => {
+    const loopback = start(["api", "--listen", "127.0.0.1:0", "--prefer-joined"])
+    assert.notEqual(await stopped(loopback), 0)
+    assert.match(loopback.errors(), /--prefer-joined needs --advertise/)
+
+    const ports = start(["api", "--listen", "127.0.0.1:0", "--udp-ports", "4463-4400"])
+    assert.notEqual(await stopped(ports), 0)
+    assert.match(ports.errors(), /port range/)
+  })
+
   it("rejects open access without an identity and keeps it for private relays", async () => {
     const open = start(["relay", "--listen", "127.0.0.1:0", "--access", "open"])
     assert.notEqual(await stopped(open), 0)
