@@ -1,11 +1,13 @@
 import { createSocket, type Socket } from "node:dgram"
+import { MAX_FORWARD_DATAGRAM } from "../constants.js"
+import type { Endpoint, OpenTransport } from "./transport.js"
 
-export type Endpoint = { host: string; port: number }
+export type { Endpoint }
 
 export function normalizeHost(host: string): string {
   if (host === "localhost") return "127.0.0.1"
   const parts = host.split(".")
-  if (parts.length !== 4) throw new Error(`V0 is IPv4 only, got ${host}`)
+  if (parts.length !== 4) throw new Error(`tesera is IPv4 only, got ${host}`)
   const octets = parts.map((part) => Number(part))
   if (octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
     throw new Error(`invalid IPv4 address ${host}`)
@@ -89,4 +91,21 @@ export function closeUdp(socket: Socket): Promise<void> {
   return new Promise((resolve) => {
     socket.close(() => resolve())
   })
+}
+
+/** A UDP socket bound to `host:port`. Port 0 picks a free port. */
+export function udpTransport(host: string, port: number): OpenTransport {
+  return async (events) => {
+    const socket = createUdpSocket()
+    const endpoint = await bindUdp(socket, host, port)
+    socket.on("message", (msg, rinfo) => events.packet(msg, { host: rinfo.address, port: rinfo.port }))
+    socket.on("error", (err) => events.error(err))
+    return {
+      endpoint,
+      // The relay's own datagram ceiling, so a UDP sender keeps the shard size it has always used.
+      maxPacketSize: MAX_FORWARD_DATAGRAM,
+      send: (packet, to) => sendUdp(socket, packet, to),
+      close: () => closeUdp(socket),
+    }
+  }
 }

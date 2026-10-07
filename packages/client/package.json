@@ -1,0 +1,60 @@
+{
+  "name": "@tesera/client",
+  "version": "0.1.0-beta",
+  "description": "the JavaScript client for tesera: send and receive files and streams over tesera relays, encrypted between the 2 endpoints",
+  "keywords": [
+    "tesera",
+    "file transfer",
+    "relay",
+    "webtransport",
+    "erasure coding",
+    "encryption"
+  ],
+  "homepage": "https://github.com/teseralabs/tesera/tree/main/packages/client#readme",
+  "bugs": {
+    "url": "https://github.com/teseralabs/tesera/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teseralabs/tesera.git",
+    "directory": "packages/client"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/types/index.d.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.js.map",
+    "dist/types",
+    "CHANGELOG.md"
+  ],
+  "tesera": {
+    "protocol": 2
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json --noEmit && node build.mjs && tsc -p tsconfig.types.json && node types.mjs",
+    "test": "npm run build && node examples.mjs && node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "buffer": "6.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "0.28.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

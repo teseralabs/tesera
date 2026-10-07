@@ -1,5 +1,5 @@
 import { ENVELOPE_LEN, PROTOCOL_VERSION } from "../constants.js"
-import type { Endpoint } from "../carrier/udp.js"
+import type { Endpoint } from "../carrier/transport.js"
 
 /** Forward envelope. ASCII TESR, distinct from the TSID identity packet. */
 const MAGIC = [0x54, 0x45, 0x53, 0x52] as const
@@ -19,6 +19,17 @@ export function encodeEnvelope(dest: Endpoint, inner: Uint8Array): Buffer {
   out.writeUInt16BE(dest.port, 9)
   out.set(inner, ENVELOPE_LEN)
   return out
+}
+
+/** True when the bytes begin with the envelope magic, whatever the version. A frame begins with the protocol version instead. */
+export function startsEnvelope(packet: Uint8Array): boolean {
+  return (
+    packet.length >= MAGIC.length &&
+    packet[0] === MAGIC[0] &&
+    packet[1] === MAGIC[1] &&
+    packet[2] === MAGIC[2] &&
+    packet[3] === MAGIC[3]
+  )
 }
 
 export function decodeEnvelope(packet: Uint8Array): { dest: Endpoint; inner: Buffer } | null {

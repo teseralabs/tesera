@@ -1,50 +1,27 @@
-// HTTP send and receive. Two calls that share a session are the two ends.
-// This process opens both UDP sockets, then runs the bytes through the relays.
-// The session secret and the payload never go in a log line.
+// The public HTTP API: the control plane, under /v1.
+//
+// Discovery lists relays and their transports. Rooms hold one offer and one answer, so 2 endpoints
+// can find each other. Neither sees a session secret, a key, or a byte of a transfer.
 
-import { createHash } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { PortPool, startOnPort, type PortRange } from "../carrier/ports.js"
-import { resolveRelayRef } from "../carrier/resolve.js"
-import { isLoopback, normalizeHost, type Endpoint } from "../carrier/udp.js"
-import {
-  DEFAULT_MAX_SENDS,
-  DEFAULT_NACK_AFTER_MS,
-  DEFAULT_RETX_AFTER_MS,
-  DEFAULT_SHARD,
-  DEFAULT_WINDOW,
-  MAX_AHEAD,
-  MAX_SHARD,
-  PROTOCOL_VERSION,
-  assertCode,
-  assertShardSize,
-} from "../constants.js"
-import { parseSession } from "../crypto/session.js"
-import { confirmRelay } from "../identity/confirm.js"
-import { discoverRelays, preferJoined } from "../identity/peers.js"
+import type { Endpoint } from "../carrier/udp.js"
+import { PROTOCOL_VERSION } from "../constants.js"
 import { ApiLimiter, DEFAULT_API_LIMITS, clientAddress, trustedProxies, type ApiLimitConfig, type LimitResult } from "./limit.js"
-import { SOFTWARE_VERSION, fetchRelayRecord, recordDocument } from "../identity/record.js"
-import { readRelaySnapshot } from "../identity/stats.js"
+import { SOFTWARE_VERSION } from "../identity/record.js"
 import type { LogFields } from "../log.js"
-import { TeseraReceiver } from "../transport/receiver.js"
-import { TeseraSender } from "../transport/sender.js"
-import { asError, concatBytes } from "../util.js"
+import type { Discovery } from "../control/discovery.js"
+import { MAX_DOCUMENT_BYTES, Rendezvous, RendezvousError } from "../control/rendezvous.js"
 
-export const MAX_API_BYTES = 25 * 1024 * 1024
-export const MAX_API_PAIRS = 32
-export const MAX_API_DEADLINE_MS = 180_000
-/** Time allowed to receive request headers. Separate from x-tesera-deadline-ms. */
+/** Time allowed to receive request headers. */
 export const API_HEADERS_TIMEOUT_MS = 10_000
 /** Time allowed to receive a complete request, including a slow body. */
 export const API_REQUEST_TIMEOUT_MS = 60_000
 export const API_KEEPALIVE_TIMEOUT_MS = 5_000
 export const API_MAX_HEADER_BYTES = 16 * 1024
-const DEFAULT_DEADLINE_MS = 60_000
-const DOCS_URL = "https://tesera.net/api.html"
-/** How long the default seed's confirmed relays are reused when `preferJoined` is on. */
-const SEED_RELAYS_MS = 30_000
-/** A retry through the seed alone needs at least this much of the deadline left. */
-const MIN_RETRY_MS = 1_000
+const DOCS_URL = "https://tesera.net/docs#api"
+/** A room request body: one offer or answer, with room for whitespace. */
+const MAX_ROOM_BODY = 2 * MAX_DOCUMENT_BYTES
+const ROOM_SWEEP_MS = 30_000
 
 export class ApiError extends Error {
   logged = false
@@ -59,21 +36,10 @@ export class ApiError extends Error {
 }
 
 export type PublicApiOptions = {
-  /** Seed used when a call names neither relays nor a discover host. */
-  discover: Endpoint
-  /** That seed's relay id, when the operator pinned it. */
-  discoverId?: string | null
-  /** Address relays can send back to. Loopback binds there. Any other address binds all interfaces. */
-  advertise: string
-  /** UDP ports for transfer sockets. Unset binds a random port. */
-  ports?: PortRange | null
-  /**
-   * Calls on the default seed use the relays joined to it and keep the seed
-   * for one retry. For a seed on this machine, which would otherwise carry every block.
-   */
-  preferJoined?: boolean
-  maxBytes?: number
-  maxPairs?: number
+  /** Serves GET /v1/relays. Unset leaves the route out. */
+  discovery?: Discovery
+  /** The rooms. Defaults to a new in-memory store. */
+  rendezvous?: Rendezvous
   /** Socket addresses allowed to supply the client through X-Forwarded-For. */
   trustProxy?: readonly string[]
   limits?: Partial<ApiLimitConfig>
@@ -85,78 +51,15 @@ export type PublicApi = {
   close: () => Promise<void>
 }
 
-type Coding = {
-  k: number
-  n: number
-  shardSize: number
-  window: number
-  maxSends: number
-  retxAfterMs: number
-  nackAfterMs: number
-}
+const ALLOW_HEADERS = "content-type, authorization"
 
-type Arrival = {
-  side: "send" | "receive"
-  session: Buffer
-  relays: Endpoint[]
-  relayKey: string
-  /** The call named no relays and no seed, so it used the default seed. */
-  seedDefault: boolean
-  payload: Buffer | null
-  deadlineAt: number
-  coding: Coding
-  abort: AbortSignal
-}
-
-type Outcome = {
-  bytes: Buffer
-  relays: number
-  tesserae: number
-  retransmits: number
-  acks: number
-}
-
-type Slot = {
-  key: string
-  first: Arrival
-  second: Arrival | null
-  running: boolean
-  settled: boolean
-  timer: NodeJS.Timeout
-  result: Promise<Outcome>
-  finish: (value: Outcome) => void
-  fail: (err: ApiError) => void
-  cancel: () => void
-}
-
-const ALLOW_HEADERS = [
-  "content-type",
-  "x-tesera-session",
-  "x-tesera-relays",
-  "x-tesera-discover",
-  "x-tesera-k",
-  "x-tesera-n",
-  "x-tesera-shard",
-  "x-tesera-window",
-  "x-tesera-max-sends",
-  "x-tesera-retx-after-ms",
-  "x-tesera-nack-after-ms",
-  "x-tesera-deadline-ms",
-].join(", ")
-
-const EXPOSE_HEADERS = "x-tesera-bytes, x-tesera-relays, x-tesera-tesserae, x-tesera-retransmits, x-tesera-acks"
-
-export async function listenPublicApi(host: string, port: number, opts: PublicApiOptions): Promise<PublicApi> {
-  const advertise = normalizeHost(opts.advertise)
-  const maxBytes = opts.maxBytes ?? MAX_API_BYTES
-  const maxPairs = opts.maxPairs ?? MAX_API_PAIRS
-  const slots = new Map<string, Slot>()
+export async function listenPublicApi(host: string, port: number, opts: PublicApiOptions = {}): Promise<PublicApi> {
   const log = opts.log ?? (() => {})
-  const pool = opts.ports ? new PortPool(opts.ports) : null
-  let seedCache: { at: number; relays: Endpoint[] } | null = null
-
   const trusted = trustedProxies(opts.trustProxy ?? [])
   const limiter = new ApiLimiter({ ...DEFAULT_API_LIMITS, ...opts.limits })
+  const rooms = opts.rendezvous ?? new Rendezvous()
+  const sweep = setInterval(() => rooms.sweep(), ROOM_SWEEP_MS)
+  sweep.unref()
   const server = createServer(
     {
       maxHeaderSize: API_MAX_HEADER_BYTES,
@@ -202,8 +105,8 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
   return {
     endpoint,
     async close() {
-      for (const slot of slots.values()) slot.fail(new ApiError(503, "unavailable"))
-      slots.clear()
+      clearInterval(sweep)
+      rooms.clear()
       await new Promise<void>((resolve) => {
         server.close(() => resolve())
         server.closeAllConnections()
@@ -215,7 +118,7 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
     const path = req.url?.split("?")[0]
     if (req.method === "OPTIONS") {
       writeCors(res, 204, {
-        "access-control-allow-methods": "GET, POST, OPTIONS",
+        "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
         "access-control-allow-headers": ALLOW_HEADERS,
         "access-control-max-age": "600",
       })
@@ -226,384 +129,135 @@ export async function listenPublicApi(host: string, port: number, opts: PublicAp
     if (!route) throw new ApiError(404, "not_found")
     if (!route.methods.has(req.method ?? "")) throw new ApiError(405, "method")
     const ip = clientAddress(req.socket.remoteAddress, forwardedFor(req), trusted)
-    if (route.kind === "info") {
-      admit(limiter.admitInfo(ip))
-      if (path === "/") {
-        sendJson(res, 200, publicIndex())
-        return
-      }
-      if (path === "/v0/record") {
-        const packet = await fetchRelayRecord(opts.discover).catch(() => null)
-        const doc = packet ? recordDocument(packet) : null
-        if (!doc) throw new ApiError(502, "record")
-        sendJson(res, 200, doc)
-        return
-      }
-      if (path === "/v0/stats") {
-        const snapshot = await readRelaySnapshot(opts.discover).catch(() => null)
-        if (!snapshot) throw new ApiError(502, "stats")
-        sendJson(res, 200, snapshot)
-        return
-      }
-      if (path === "/v0/peers") {
-        const found = await discoverRelays(opts.discover, { pinned: opts.discoverId }).catch(() => null)
-        if (!found) throw new ApiError(502, "peers")
-        sendJson(res, 200, {
-          relays: found.map((relay) => ({ id: relay.id, host: relay.endpoint.host, port: relay.endpoint.port })),
-        })
-        return
-      }
-      throw new ApiError(404, "not_found")
+    admit(limiter.admitInfo(ip))
+    if (route.kind === "index") {
+      sendJson(res, 200, publicIndex())
+      return
     }
+    if (route.kind === "relays") {
+      if (!opts.discovery) throw new ApiError(404, "not_found")
+      sendJson(res, 200, opts.discovery.document())
+      return
+    }
+    await room(req, res, route, ip)
+  }
 
-    admit(limiter.admitTransfer(ip))
-    limiter.hold(ip)
+  /** The room routes. The room id and token never go in a log line. */
+  async function room(req: IncomingMessage, res: ServerResponse, route: Route, ip: string): Promise<void> {
+    const { room, answer } = route
     try {
-      const declared = declaredLength(req)
-      if (declared !== null && declared > maxBytes) throw new ApiError(413, "size")
-      if (declared !== null) admit(limiter.bytesFit(ip, declared))
-      const side = path === "/v0/send" ? "send" : "receive"
-      const deadlineMs = headerInt(req, "x-tesera-deadline-ms", DEFAULT_DEADLINE_MS, 1_000, MAX_API_DEADLINE_MS)
-      const deadlineAt = Date.now() + deadlineMs
-      const session = readSession(req)
-      const coding = readCoding(req)
-      const payload = side === "send" ? await readBody(req, maxBytes) : await drain(req, maxBytes)
-      if (side === "send" && payload.length === 0) throw new ApiError(400, "empty")
-      if (side === "send") admit(limiter.addBytes(ip, payload.length))
-      const { relays, seedDefault } = await resolveCallRelays(req, seedRelays)
-      const outcome = await enter(sessionKey(session), {
-        side,
-        session,
-        relays,
-        relayKey: relayKey(relays),
-        seedDefault,
-        payload: side === "send" ? payload : null,
-        deadlineAt,
-        coding,
-        abort: abortFrom(req, res),
-      })
+      if (!room) {
+        const text = await readText(req)
+        admit(limiter.admitCreate(ip))
+        const created = rooms.create(text)
+        log("rendezvous", { step: "open", rooms: rooms.size })
+        sendJson(res, 201, { room: created.room, token: created.token, expiresAt: Math.floor(created.expiresAt / 1000) })
+        return
+      }
+      if (!answer && req.method === "GET") {
+        sendDocument(res, 200, rooms.offer(room).offer)
+        return
+      }
+      if (!answer && req.method === "DELETE") {
+        rooms.close(room, bearer(req))
+        log("rendezvous", { step: "close", rooms: rooms.size })
+        writeCors(res, 204)
+        res.end()
+        return
+      }
+      if (req.method === "POST") {
+        rooms.answer(room, await readText(req))
+        log("rendezvous", { step: "answer" })
+        writeCors(res, 204)
+        res.end()
+        return
+      }
+      const waitMs = waitParam(req.url)
+      const found = await rooms.waitAnswer(room, bearer(req), waitMs, abortFrom(req, res))
       if (res.writableEnded || res.destroyed) return
-      if (side === "receive") {
-        admit(limiter.addBytes(ip, outcome.bytes.length))
-        writeCors(res, 200, {
-          "content-type": "application/octet-stream",
-          "cache-control": "no-store",
-          "x-tesera-bytes": String(outcome.bytes.length),
-          "x-tesera-relays": String(outcome.relays),
-          "x-tesera-tesserae": String(outcome.tesserae),
-          "x-tesera-retransmits": String(outcome.retransmits),
-          "x-tesera-acks": String(outcome.acks),
-        })
-        res.end(outcome.bytes)
+      if (found !== null) {
+        sendDocument(res, 200, found)
         return
       }
-      sendJson(res, 200, {
-        bytes: outcome.bytes.length,
-        relays: outcome.relays,
-        tesserae: outcome.tesserae,
-        retransmits: outcome.retransmits,
-        acks: outcome.acks,
-      })
-    } finally {
-      limiter.release(ip)
-    }
-  }
-
-  function enter(key: string, arrival: Arrival): Promise<Outcome> {
-    const existing = slots.get(key)
-    if (existing) {
-      if (existing.settled || existing.running || existing.second || existing.first.side === arrival.side) {
-        throw new ApiError(409, "in_use")
-      }
-      if (existing.first.relayKey !== arrival.relayKey) throw new ApiError(409, "relays")
-      existing.second = arrival
-      existing.running = true
-      clearTimeout(existing.timer)
-      watchAbort(existing, arrival)
-      void run(existing).catch((err) => {
-        existing.fail(err instanceof ApiError ? err : new ApiError(502, "transfer"))
-      })
-      return existing.result
-    }
-    if (slots.size >= maxPairs) throw new ApiError(503, "busy")
-
-    let finish: (value: Outcome) => void = () => {}
-    let reject: (err: ApiError) => void = () => {}
-    const result = new Promise<Outcome>((resolve, rejectPromise) => {
-      finish = resolve
-      reject = rejectPromise
-    })
-    const slot: Slot = {
-      key,
-      first: arrival,
-      second: null,
-      running: false,
-      settled: false,
-      timer: setTimeout(() => {
-        slot.fail(new ApiError(408, "timeout"))
-      }, Math.max(1, arrival.deadlineAt - Date.now())),
-      result,
-      finish: (value) => {
-        if (slot.settled) return
-        slot.settled = true
-        clearTimeout(slot.timer)
-        slots.delete(key)
-        finish(value)
-      },
-      fail: (err) => {
-        if (slot.settled) return
-        slot.settled = true
-        clearTimeout(slot.timer)
-        slots.delete(key)
-        reject(err)
-      },
-      cancel: () => {},
-    }
-    slots.set(key, slot)
-    watchAbort(slot, arrival)
-    return result
-  }
-
-  function watchAbort(slot: Slot, arrival: Arrival): void {
-    const stop = () => {
-      if (slot.settled) return
-      if (!slot.running) {
-        slot.fail(new ApiError(499, "closed"))
-        return
-      }
-      slot.cancel()
-      slot.fail(new ApiError(502, "transfer"))
-    }
-    if (arrival.abort.aborted) stop()
-    else arrival.abort.addEventListener("abort", stop, { once: true })
-  }
-
-  /** The default seed's confirmed relays, seed first. Reused briefly when `preferJoined` is on. */
-  async function seedRelays(): Promise<Endpoint[]> {
-    const now = Date.now()
-    if (opts.preferJoined && seedCache && now - seedCache.at < SEED_RELAYS_MS) return seedCache.relays
-    const found = await discoverRelays(opts.discover, { pinned: opts.discoverId ?? null })
-    const relays = found.map((relay) => relay.endpoint)
-    if (opts.preferJoined) seedCache = { at: now, relays }
-    return relays
-  }
-
-  async function run(slot: Slot): Promise<void> {
-    const send = slot.first.side === "send" ? slot.first : slot.second
-    const receive = slot.first.side === "receive" ? slot.first : slot.second
-    if (!send?.payload || !receive) throw new ApiError(502, "transfer")
-    const deadlineAt = Math.min(send.deadlineAt, receive.deadlineAt)
-    const left = deadlineAt - Date.now()
-    if (left < 1) throw new ApiError(408, "timeout")
-    const plan =
-      opts.preferJoined && send.seedDefault ? preferJoined(send.relays) : { relays: send.relays, fallback: null }
-    try {
-      let outcome: Outcome
-      try {
-        const firstMs = plan.fallback ? Math.ceil(left / 2) : left
-        outcome = await move(slot, send, receive, advertise, firstMs, plan.relays, pool)
-      } catch (err) {
-        const rest = deadlineAt - Date.now()
-        if (!plan.fallback || slot.settled || err instanceof ApiError || rest < MIN_RETRY_MS) throw err
-        const timedOut = asError(err).message === "transfer timed out"
-        log("retry", { relays: plan.relays.length, reason: timedOut ? "timeout" : "transfer" })
-        outcome = await move(slot, send, receive, advertise, rest, plan.fallback, pool)
-      }
-      if (slot.settled) return
-      log("send", {
-        bytes: outcome.bytes.length,
-        relays: outcome.relays,
-        tesserae: outcome.tesserae,
-        retransmits: outcome.retransmits,
-        acks: outcome.acks,
-      })
-      slot.finish(outcome)
+      // An empty wait: either no answer yet, or the room went away while waiting.
+      await rooms.waitAnswer(room, bearer(req), 0)
+      writeCors(res, 204, { "cache-control": "no-store" })
+      res.end()
     } catch (err) {
-      if (slot.settled) return
-      const timedOut = asError(err).message === "transfer timed out"
-      throw timedOut ? new ApiError(408, "timeout") : err instanceof ApiError ? err : new ApiError(502, "transfer")
+      if (err instanceof RendezvousError) throw new ApiError(err.status, err.code)
+      throw err
     }
   }
 }
 
-async function move(
-  slot: Slot,
-  send: Arrival,
-  receive: Arrival,
-  advertise: string,
-  deadlineMs: number,
-  relays: Endpoint[],
-  pool: PortPool | null,
-): Promise<Outcome> {
-  const payload = send.payload
-  if (!payload) throw new ApiError(502, "transfer")
-  const bindHost = isLoopback(advertise) ? advertise : "0.0.0.0"
-  const rx = await startOnPort(
-    pool,
-    (port) =>
-      new TeseraReceiver({
-        session: send.session,
-        relays,
-        bindHost,
-        bindPort: port,
-        nackAfterMs: receive.coding.nackAfterMs,
-      }),
-  )
-  if (!rx) throw new ApiError(503, "busy")
-  const receiver = rx.item
-  let sender: TeseraSender | undefined
-  let txPort: number | null = null
-  slot.cancel = () => {
-    sender?.fail(new Error("closed"))
-    receiver.fail(new Error("closed"))
+function abortFrom(req: IncomingMessage, res: ServerResponse): AbortSignal {
+  const controller = new AbortController()
+  const stop = () => {
+    if (!res.writableFinished) controller.abort()
   }
-  let readError: Error | null = null
-  const reading = readAll(receiver).catch((err: unknown) => {
-    readError = asError(err)
-    return Buffer.alloc(0)
+  res.on("close", stop)
+  req.on("aborted", stop)
+  return controller.signal
+}
+
+function note(log: (event: string, fields: LogFields) => void, err: ApiError): void {
+  if (err.logged || err.code === "closed") return
+  err.logged = true
+  log(err.status >= 500 ? "error" : "reject", { reason: err.code })
+}
+
+function writeCors(res: ServerResponse, status: number, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    "access-control-allow-origin": "*",
+    ...headers,
   })
-  try {
-    const boundRx = receiver.endpoint
-    const tx = await startOnPort(
-      pool,
-      (port) =>
-        new TeseraSender({
-          session: send.session,
-          relays,
-          receiver: { host: advertise, port: boundRx.port },
-          bindHost,
-          bindPort: port,
-          k: send.coding.k,
-          n: send.coding.n,
-          shardSize: send.coding.shardSize,
-          window: send.coding.window,
-          maxSends: send.coding.maxSends,
-          retxAfterMs: send.coding.retxAfterMs,
-          deadlineMs,
-        }),
-    )
-    if (!tx) throw new ApiError(503, "busy")
-    sender = tx.item
-    txPort = tx.port
-    const boundTx = sender.endpoint
-    receiver.setSender({ host: advertise, port: boundTx.port })
-    sender.onPeerFail = (err) => receiver.fail(err)
-    receiver.onPeerFail = (err) => sender?.fail(err)
-    await sender.write(payload)
-    await sender.end()
-    const output = await reading
-    if (readError) throw readError
-    if (!output.equals(payload)) throw new Error("transfer mismatch")
-    return {
-      bytes: output,
-      relays: relays.length,
-      tesserae: sender.stats.tesseraSends,
-      retransmits: sender.stats.tesseraRetransmissions,
-      acks: receiver.stats.acksSent,
-    }
-  } finally {
-    slot.cancel = () => {}
-    await sender?.close()
-    await receiver.close()
-    await reading.catch(() => {})
-    if (pool && rx.port !== null) pool.release(rx.port)
-    if (pool && txPort !== null) pool.release(txPort)
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+  writeCors(res, status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    ...extra,
+  })
+  res.end(JSON.stringify(body))
+}
+
+function publicIndex(): {
+  name: string
+  software: string
+  wire: number
+  endpoints: Record<string, string>
+  docs: string
+} {
+  return {
+    name: "tesera control plane",
+    software: SOFTWARE_VERSION,
+    wire: PROTOCOL_VERSION,
+    endpoints: {
+      relays: "GET /v1/relays",
+      rooms: "POST /v1/rooms",
+    },
+    docs: DOCS_URL,
   }
 }
 
-async function readAll(receiver: TeseraReceiver): Promise<Buffer> {
-  const chunks: Uint8Array[] = []
-  for (;;) {
-    const chunk = await receiver.read()
-    if (!chunk) return concatBytes(chunks)
-    chunks.push(chunk)
+type Route = {
+  kind: "index" | "relays" | "rooms"
+  methods: Set<string>
+  room?: string
+  answer?: boolean
+}
+
+function routeOf(path: string | undefined): Route | null {
+  if (path === "/") return { kind: "index", methods: new Set(["GET"]) }
+  if (path === "/v1/relays") return { kind: "relays", methods: new Set(["GET"]) }
+  if (path === "/v1/rooms") return { kind: "rooms", methods: new Set(["POST"]) }
+  const room = /^\/v1\/rooms\/([^/]+)(\/answer)?$/.exec(path ?? "")
+  if (room) {
+    const answer = room[2] !== undefined
+    return { kind: "rooms", methods: new Set(answer ? ["GET", "POST"] : ["GET", "DELETE"]), room: room[1], answer }
   }
-}
-
-function sessionKey(session: Buffer): string {
-  return createHash("sha256").update(session).digest("hex")
-}
-
-function relayKey(relays: Endpoint[]): string {
-  return relays.map((relay) => `${relay.host}:${relay.port}`).sort().join(",")
-}
-
-function readSession(req: IncomingMessage): Buffer {
-  try {
-    return parseSession(headerText(req, "x-tesera-session") ?? "")
-  } catch {
-    throw new ApiError(400, "session")
-  }
-}
-
-function readCoding(req: IncomingMessage): Coding {
-  const k = headerInt(req, "x-tesera-k", 2, 1, 32)
-  const n = headerInt(req, "x-tesera-n", 3, 1, 32)
-  const shardSize = headerInt(req, "x-tesera-shard", DEFAULT_SHARD, 1, MAX_SHARD)
-  const window = headerInt(req, "x-tesera-window", DEFAULT_WINDOW, 1, MAX_AHEAD)
-  const maxSends = headerInt(req, "x-tesera-max-sends", DEFAULT_MAX_SENDS, 1, 100)
-  const retxAfterMs = headerInt(req, "x-tesera-retx-after-ms", DEFAULT_RETX_AFTER_MS, 1, 60_000)
-  const nackAfterMs = headerInt(req, "x-tesera-nack-after-ms", DEFAULT_NACK_AFTER_MS, 1, 60_000)
-  try {
-    assertCode(k, n)
-    assertShardSize(shardSize)
-  } catch {
-    throw new ApiError(400, "option")
-  }
-  return { k, n, shardSize, window, maxSends, retxAfterMs, nackAfterMs }
-}
-
-async function resolveCallRelays(
-  req: IncomingMessage,
-  seedRelays: () => Promise<Endpoint[]>,
-): Promise<{ relays: Endpoint[]; seedDefault: boolean }> {
-  const listed = headerText(req, "x-tesera-relays")
-  const discover = headerText(req, "x-tesera-discover")
-  if (listed !== undefined && discover !== undefined) throw new ApiError(400, "option")
-  try {
-    if (listed !== undefined) return { relays: await listedRelays(listed), seedDefault: false }
-    if (discover === undefined) {
-      const relays = await seedRelays()
-      if (relays.length < 1) throw new ApiError(400, "relays")
-      return { relays, seedDefault: true }
-    }
-    const ref = await resolveRelayRef(discover)
-    const found = await discoverRelays(ref.endpoint, { pinned: ref.id })
-    if (found.length < 1) throw new ApiError(400, "relays")
-    return { relays: found.map((relay) => relay.endpoint), seedDefault: false }
-  } catch (err) {
-    if (err instanceof ApiError) throw err
-    throw new ApiError(400, "relays")
-  }
-}
-
-async function listedRelays(value: string): Promise<Endpoint[]> {
-  const parts = value
-    .split(",")
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0)
-  if (parts.length < 1) throw new ApiError(400, "relays")
-  const refs = await Promise.all(parts.map((part) => resolveRelayRef(part)))
-  await Promise.all(refs.flatMap((ref) => (ref.id === null ? [] : [confirmRelay(ref.endpoint, ref.id)])))
-  return refs.map((ref) => ref.endpoint)
-}
-
-function headerText(req: IncomingMessage, name: string): string | undefined {
-  const value = req.headers[name]
-  if (value === undefined) return undefined
-  if (Array.isArray(value)) throw new ApiError(400, "option")
-  const trimmed = value.trim()
-  if (trimmed.length === 0) throw new ApiError(400, "option")
-  return trimmed
-}
-
-function headerInt(req: IncomingMessage, name: string, fallback: number, min: number, max: number): number {
-  const text = headerText(req, name)
-  if (text === undefined) return fallback
-  if (!/^\d+$/.test(text)) throw new ApiError(400, "option")
-  const parsed = Number(text)
-  if (!Number.isInteger(parsed) || parsed < min || parsed > max) throw new ApiError(400, "option")
-  return parsed
+  return null
 }
 
 function readBody(req: IncomingMessage, max: number): Promise<Buffer> {
@@ -631,80 +285,45 @@ function readBody(req: IncomingMessage, max: number): Promise<Buffer> {
       if (!failed) resolve(Buffer.concat(chunks))
     })
     req.on("error", (err) => {
-      if (!failed) reject(asError(err))
+      if (!failed) reject(err)
     })
   })
 }
 
-async function drain(req: IncomingMessage, max: number): Promise<Buffer> {
-  if (req.method === "GET" || req.method === "HEAD") return Buffer.alloc(0)
-  await readBody(req, max)
-  return Buffer.alloc(0)
+async function readText(req: IncomingMessage): Promise<string> {
+  const body = await readBody(req, MAX_ROOM_BODY)
+  const text = body.toString("utf8")
+  if (!Buffer.from(text, "utf8").equals(body)) throw new ApiError(400, "document")
+  return text
 }
 
-function abortFrom(req: IncomingMessage, res: ServerResponse): AbortSignal {
-  const controller = new AbortController()
-  const stop = () => {
-    if (!res.writableFinished) controller.abort()
-  }
-  res.on("close", stop)
-  req.on("aborted", stop)
-  return controller.signal
+function headerText(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name]
+  if (value === undefined) return undefined
+  if (Array.isArray(value)) throw new ApiError(400, "option")
+  const trimmed = value.trim()
+  if (trimmed.length === 0) throw new ApiError(400, "option")
+  return trimmed
 }
 
-function note(log: (event: string, fields: LogFields) => void, err: ApiError): void {
-  if (err.logged || err.code === "closed") return
-  err.logged = true
-  log(err.status >= 500 ? "error" : "reject", { reason: err.code })
+function bearer(req: IncomingMessage): string {
+  const match = /^Bearer ([A-Za-z0-9_-]{1,64})$/.exec(headerText(req, "authorization") ?? "")
+  if (!match?.[1]) throw new ApiError(401, "token")
+  return match[1]
 }
 
-function writeCors(res: ServerResponse, status: number, headers: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    "access-control-allow-origin": "*",
-    "access-control-expose-headers": EXPOSE_HEADERS,
-    ...headers,
-  })
+/** `?wait=SECONDS`, 0 when absent. The store caps it. */
+function waitParam(url: string | undefined): number {
+  const value = new URLSearchParams(url?.split("?")[1] ?? "").get("wait")
+  if (value === null) return 0
+  if (!/^\d{1,3}$/.test(value)) throw new ApiError(400, "option")
+  return Number(value) * 1000
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  writeCors(res, status, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    ...extra,
-  })
-  res.end(JSON.stringify(body))
-}
-
-function publicIndex(): {
-  name: string
-  software: string
-  wire: number
-  endpoints: { send: string; receive: string; record: string; stats: string; peers: string }
-  docs: string
-} {
-  return {
-    name: "tesera public api",
-    software: SOFTWARE_VERSION,
-    wire: PROTOCOL_VERSION,
-    endpoints: {
-      send: "POST /v0/send",
-      receive: "POST /v0/receive",
-      record: "GET /v0/record",
-      stats: "GET /v0/stats",
-      peers: "GET /v0/peers",
-    },
-    docs: DOCS_URL,
-  }
-}
-
-type Route = { kind: "info" | "transfer"; methods: Set<string> }
-
-function routeOf(path: string | undefined): Route | null {
-  if (path === "/" || path === "/v0/record" || path === "/v0/stats" || path === "/v0/peers") {
-    return { kind: "info", methods: new Set(["GET"]) }
-  }
-  if (path === "/v0/send" || path === "/v0/receive") return { kind: "transfer", methods: new Set(["POST"]) }
-  return null
+/** A stored offer or answer, as the exact text the endpoint sent. */
+function sendDocument(res: ServerResponse, status: number, text: string): void {
+  writeCors(res, status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" })
+  res.end(text)
 }
 
 function admit(result: LimitResult): void {
@@ -720,14 +339,4 @@ function forwardedFor(req: IncomingMessage): string | undefined {
   const value = req.headers["x-forwarded-for"]
   if (value === undefined) return undefined
   return Array.isArray(value) ? value.join(", ") : value
-}
-
-function declaredLength(req: IncomingMessage): number | null {
-  const raw = req.headers["content-length"]
-  if (raw === undefined) return null
-  const text = Array.isArray(raw) ? raw[0] : raw
-  if (!text || !/^\d+$/.test(text)) return null
-  const parsed = Number(text)
-  if (!Number.isSafeInteger(parsed)) return null
-  return parsed
 }

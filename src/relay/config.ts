@@ -13,7 +13,7 @@ export type RelaySettings = {
   logLevel: LogLevel
   /** Cumulative bytes and transfers, reloaded on the next start. Null leaves counters in memory. */
   analyticsFile: string | null
-  /** TCP address for GET /v0/stats. Null leaves the API off. */
+  /** TCP address for the relay API. Null leaves the API off. */
   api: { host: string; port: number } | null
   /** How long a quiet relay stays remembered, in milliseconds. */
   peerTtlMs: number

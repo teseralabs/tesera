@@ -1,5 +1,4 @@
-import { type Socket } from "node:dgram"
-import { bindUdp, closeUdp, createUdpSocket, sendUdp, type Endpoint } from "../carrier/udp.js"
+import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { decodeShards, joinShards } from "../coding/reedsolomon.js"
 import {
   DEFAULT_ACK_GRACE_MS,
@@ -13,6 +12,8 @@ import { emptyReceiverStats, type ReceiverStats } from "../metrics.js"
 import { encodeEnvelope } from "../protocol/envelope.js"
 import { decodeFrame, encodeAck, encodeNack, encodeSample, type DataFrame } from "../protocol/frames.js"
 import { asError, Signal, sleep } from "../util.js"
+import { addressPerRelay, type PeerAddress } from "./address.js"
+import type { Probe } from "./probe.js"
 
 type PartialBlock = {
   k: number
@@ -32,12 +33,24 @@ type ReadyBlock = {
 export type ReceiverOptions = {
   session: Buffer
   relays: Endpoint[]
-  sender?: Endpoint
+  /** The sender's address in each envelope: one for every relay, or one per relay in relay order. */
+  sender?: PeerAddress
+  /** The sender's session id, when known ahead. Omitted means the first valid data frame picks it. */
+  sessionId?: Uint8Array
+  /** How packets travel. Omitted means a UDP socket on `bindHost:bindPort`. */
+  transport?: OpenTransport
   bindHost?: string
   bindPort?: number
   nackAfterMs?: number
   tickMs?: number
   maxAhead?: number
+  /**
+   * Delivered bytes that `read` has not taken yet, past which new blocks wait for their ACK.
+   * A slow reader then holds the sender's window instead of growing this queue. Omitted means no limit.
+   */
+  maxUnreadBytes?: number
+  /** Timing notes for diagnostics. */
+  probe?: Probe
 }
 
 export class TeseraReceiver {
@@ -51,8 +64,8 @@ export class TeseraReceiver {
   private readonly nackAfterMs: number
   private readonly tickMs: number
   private readonly maxAhead: number
-  private readonly bindHost: string
-  private readonly bindPort: number
+  private readonly openTransport: OpenTransport
+  private readonly probe: Probe | null
   private readonly partials = new Map<number, PartialBlock>()
   private readonly ready = new Map<number, ReadyBlock>()
   private readonly done = new Set<number>()
@@ -66,11 +79,16 @@ export class TeseraReceiver {
   private settledMissing = 0
   private settledPartial = 0
   private readonly chunks: Buffer[] = []
+  private unreadBytes = 0
+  private readonly maxUnreadBytes: number
+  /** Blocks held unacknowledged until `read` brings the unread bytes back under the limit. */
+  private readonly heldAcks = new Set<number>()
   private readonly readWake = new Signal()
 
-  private socket: Socket | null = null
+  private transport: PacketTransport | null = null
   private bound: Endpoint | null = null
-  private sender: Endpoint | null
+  /** By relay index. */
+  private senders: Endpoint[] | null
   private sessionId: Buffer | null = null
   private k = 0
   private n = 0
@@ -80,19 +98,22 @@ export class TeseraReceiver {
   private stopped = false
   private closed = false
   private error: Error | null = null
-  private timer: NodeJS.Timeout | null = null
+  private timer: ReturnType<typeof setTimeout> | null = null
 
   constructor(opts: ReceiverOptions) {
     assertSession(opts.session)
     this.secret = opts.session
     if (opts.relays.length < 1) throw new Error("receiver needs at least one relay")
     this.relays = opts.relays
-    this.sender = opts.sender ?? null
+    this.senders = opts.sender ? addressPerRelay(opts.sender, opts.relays) : null
     this.nackAfterMs = opts.nackAfterMs ?? DEFAULT_NACK_AFTER_MS
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
     this.maxAhead = opts.maxAhead ?? MAX_AHEAD
-    this.bindHost = opts.bindHost ?? "127.0.0.1"
-    this.bindPort = opts.bindPort ?? 0
+    this.maxUnreadBytes = opts.maxUnreadBytes ?? Infinity
+    if (!(this.maxUnreadBytes > 0)) throw new Error("maxUnreadBytes must be > 0")
+    this.openTransport = transportOrUdp(opts)
+    this.probe = opts.probe ?? null
+    if (opts.sessionId) this.adopt(Buffer.from(opts.sessionId))
   }
 
   get endpoint(): Endpoint {
@@ -100,20 +121,19 @@ export class TeseraReceiver {
     return this.bound
   }
 
-  setSender(endpoint: Endpoint): void {
-    this.sender = endpoint
+  setSender(sender: PeerAddress): void {
+    this.senders = addressPerRelay(sender, this.relays)
   }
 
   async start(): Promise<Endpoint> {
-    const socket = createUdpSocket()
-    this.socket = socket
-    this.bound = await bindUdp(socket, this.bindHost, this.bindPort)
-    socket.on("message", (msg, rinfo) => {
-      void this.onMessage(Buffer.from(msg), { host: rinfo.address, port: rinfo.port }).catch((err) =>
-        this.fail(err),
-      )
+    const transport = await this.openTransport({
+      packet: (packet, from) => {
+        void this.onMessage(Buffer.from(packet), from).catch((err) => this.fail(err))
+      },
+      error: (err) => this.fail(err),
     })
-    socket.on("error", (err) => this.fail(err))
+    this.transport = transport
+    this.bound = transport.endpoint
     this.arm()
     return this.bound
   }
@@ -121,7 +141,11 @@ export class TeseraReceiver {
   async read(): Promise<Uint8Array | null> {
     for (;;) {
       const next = this.chunks.shift()
-      if (next) return next
+      if (next) {
+        this.unreadBytes -= next.length
+        this.releaseAcks()
+        return next
+      }
       if (this.error) throw this.error
       if (this.streamEnded && this.ready.size === 0) return null
       await this.readWake.wait()
@@ -159,9 +183,9 @@ export class TeseraReceiver {
     }
     if (!this.error && !this.streamEnded) this.error = new Error("receiver closed before completion")
     this.readWake.notify()
-    const socket = this.socket
-    this.socket = null
-    if (socket) await closeUdp(socket).catch(() => {})
+    const transport = this.transport
+    this.transport = null
+    if (transport) await transport.close().catch(() => {})
   }
 
   /** The first session id selects the keys. A different id is not stored. */
@@ -177,18 +201,23 @@ export class TeseraReceiver {
   private async onMessage(msg: Buffer, remote: Endpoint): Promise<void> {
     if (this.closed || this.error) return
     // A data frame has no MAC and the first one picks the session id, so only relays may deliver.
-    if (!this.relayFor(remote)) return
+    if (this.relayIndex(remote) < 0) return
+    const probe = this.probe
+    const t0 = probe ? performance.now() : 0
     const frame = decodeFrame(msg, this.macKey)
+    if (probe) probe.note("receiver.data-decode", performance.now() - t0)
     if (!frame || frame.kind !== "data") return
     if (this.sessionId && !this.sessionId.equals(frame.sessionId)) return
     if (frame.blockId < this.nextDeliver) {
-      if (this.ackable.has(frame.blockId)) await this.sendAck(frame.blockId)
+      probe?.note("receiver.late-tessera", 1)
+      if (this.ackable.has(frame.blockId)) await this.ackOrHold(frame.blockId)
       return
     }
     if (frame.blockId > this.nextDeliver + this.maxAhead) return
     if (!this.adopt(frame.sessionId)) return
     if (this.done.has(frame.blockId)) {
-      await this.sendAck(frame.blockId)
+      probe?.note("receiver.late-tessera", 1)
+      await this.ackOrHold(frame.blockId)
       return
     }
     const first = this.noteArrival(frame.blockId, frame.tesseraIndex)
@@ -216,6 +245,7 @@ export class TeseraReceiver {
       }
       this.partials.set(frame.blockId, partial)
       this.missingSince.delete(frame.blockId)
+      this.probe?.step(frame.blockId, "first", performance.now())
     } else if (partial.cipherLen !== frame.cipherLen || partial.shardLen !== frame.payload.length) {
       this.fail(new Error(`block ${frame.blockId} tesserae disagree on length`))
       return
@@ -224,7 +254,10 @@ export class TeseraReceiver {
     if (frame.blockId > this.highestSeen) this.highestSeen = frame.blockId
     this.noteGaps()
     this.noteBuffer()
-    if (partial.shards.size >= partial.k) this.reconstruct(frame.blockId, partial)
+    if (partial.shards.size >= partial.k) {
+      this.probe?.step(frame.blockId, "k", performance.now())
+      this.reconstruct(frame.blockId, partial)
+    }
   }
 
   private reconstruct(blockId: number, partial: PartialBlock): void {
@@ -252,6 +285,11 @@ export class TeseraReceiver {
         }),
       )
       this.stats.decryptMs += performance.now() - t1
+      if (this.probe) {
+        this.probe.note("receiver.reconstruct", t1 - t0)
+        this.probe.note("receiver.open", performance.now() - t1)
+        this.probe.note("receiver.resident", this.partials.size + this.ready.size)
+      }
     } catch (err) {
       this.fail(new Error(`block ${blockId} failed integrity check: ${asError(err).message}`))
       return
@@ -264,7 +302,23 @@ export class TeseraReceiver {
     const latencyMs = Math.max(0, Date.now() - opened.sentAtMs)
     this.ready.set(blockId, { body: opened.body, fin: opened.fin, latencyMs })
     this.drain()
-    void this.sendAck(blockId).catch((err) => this.fail(err))
+    void this.ackOrHold(blockId).catch((err) => this.fail(err))
+  }
+
+  private async ackOrHold(blockId: number): Promise<void> {
+    if (this.unreadBytes >= this.maxUnreadBytes) {
+      if (!this.heldAcks.has(blockId)) this.probe?.note("receiver.ack-held", 1)
+      this.heldAcks.add(blockId)
+      return
+    }
+    await this.sendAck(blockId)
+  }
+
+  private releaseAcks(): void {
+    if (this.heldAcks.size === 0 || this.unreadBytes >= this.maxUnreadBytes || this.stopped) return
+    const ids = [...this.heldAcks]
+    this.heldAcks.clear()
+    for (const id of ids) void this.sendAck(id).catch((err) => this.fail(err))
   }
 
   private drain(): void {
@@ -279,8 +333,11 @@ export class TeseraReceiver {
       this.pruneAckable()
       if (item.body.length > 0) {
         this.chunks.push(item.body)
+        this.unreadBytes += item.body.length
+        if (this.unreadBytes > this.stats.maxUnreadBytes) this.stats.maxUnreadBytes = this.unreadBytes
         this.stats.outputBytes += item.body.length
       }
+      this.probe?.step(blockId, "delivered", performance.now())
       this.stats.latencySumMs += item.latencyMs
       this.stats.latencyCount++
       if (item.latencyMs > this.stats.maxBlockLatencyMs) this.stats.maxBlockLatencyMs = item.latencyMs
@@ -360,7 +417,7 @@ export class TeseraReceiver {
   }
 
   private async nackTick(): Promise<void> {
-    if (this.stopped || !this.sender || this.n === 0) return
+    if (this.stopped || !this.senders || this.n === 0) return
     const now = Date.now()
     for (const id of this.nackPace.keys()) {
       if (!this.partials.has(id) && !this.missingSince.has(id)) this.nackPace.delete(id)
@@ -399,32 +456,34 @@ export class TeseraReceiver {
   }
 
   private async sendSample(blockId: number, tesseraIndex: number, remote: Endpoint): Promise<void> {
-    const relay = this.relayFor(remote)
-    const sender = this.sender
-    const socket = this.socket
-    if (!relay || !sender || !socket || !this.sessionId || !this.macKey) return
+    const index = this.relayIndex(remote)
+    const relay = this.relays[index]
+    const sender = this.senders?.[index]
+    const transport = this.transport
+    if (!relay || !sender || !transport || !this.sessionId || !this.macKey) return
     const frame = encodeSample(
       { kind: "sample", sessionId: this.sessionId, blockId, tesseraIndex },
       this.macKey,
     )
     const packet = encodeEnvelope(sender, frame)
     this.stats.controlWireBytes += packet.length
-    await sendUdp(socket, packet, relay)
+    await transport.send(packet, relay)
   }
 
-  private relayFor(remote: Endpoint): Endpoint | null {
-    for (const relay of this.relays) {
-      if (relay.port === remote.port && relay.host === remote.host) return relay
-    }
-    return null
+  private relayIndex(remote: Endpoint): number {
+    return this.relays.findIndex((relay) => relay.port === remote.port && relay.host === remote.host)
   }
 
   private async sendAck(blockId: number): Promise<void> {
     if (!this.sessionId) return
     if (!this.macKey) return
+    const probe = this.probe
+    const t0 = probe ? performance.now() : 0
     const frame = encodeAck({ kind: "ack", sessionId: this.sessionId, blockId }, this.macKey)
     this.stats.acksSent++
+    if (probe) probe.step(blockId, "ack", t0)
     await this.fanout(frame)
+    if (probe) probe.note("receiver.ack-send", performance.now() - t0)
   }
 
   private async sendNack(blockId: number, missing: number[]): Promise<void> {
@@ -432,18 +491,21 @@ export class TeseraReceiver {
     if (!this.macKey) return
     const frame = encodeNack({ kind: "nack", sessionId: this.sessionId, blockId, missing }, this.macKey)
     this.stats.nacksSent++
+    this.probe?.note("receiver.nack", missing.length)
     await this.fanout(frame)
   }
 
   private async fanout(frame: Buffer): Promise<void> {
-    const sender = this.sender
-    const socket = this.socket
-    if (!sender || !socket) throw new Error("receiver has no return path")
+    const senders = this.senders
+    const transport = this.transport
+    if (!senders || !transport) throw new Error("receiver has no return path")
     await Promise.all(
-      this.relays.map(async (relay) => {
+      this.relays.map(async (relay, index) => {
+        const sender = senders[index]
+        if (!sender) return
         const packet = encodeEnvelope(sender, frame)
         this.stats.controlWireBytes += packet.length
-        await sendUdp(socket, packet, relay)
+        await transport.send(packet, relay)
       }),
     )
   }

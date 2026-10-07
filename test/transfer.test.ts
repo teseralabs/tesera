@@ -80,6 +80,32 @@ describe("scheduler", () => {
     assert.deepEqual(scheduler.plan(), [1, 2, null])
   })
 
+  it("stops retransmitting on a measured path that died while the others are busy", () => {
+    const scheduler = new PathScheduler(3, 2, 3)
+    for (let round = 0; round < 50; round++) {
+      for (const relay of [0, 1, 2]) {
+        scheduler.noteSend(relay)
+        scheduler.observe(relay, 20)
+      }
+    }
+    for (let i = 0; i < 30; i++) {
+      scheduler.noteSend(0)
+      scheduler.noteSend(1)
+    }
+    const picks: number[] = []
+    for (let i = 0; i < 40; i++) {
+      const relay = scheduler.best()
+      picks.push(relay)
+      scheduler.noteSend(relay, false)
+      if (relay === 2) scheduler.miss(2)
+      else {
+        scheduler.observe(relay, 20)
+        scheduler.noteSend(relay)
+      }
+    }
+    assert.ok(picks.filter((relay) => relay === 2).length <= 3, `dead path picked ${picks.join(",")}`)
+  })
+
   it("learns a path from a sample that arrives after the block is finished", () => {
     const scheduler = new PathScheduler(3, 2, 3)
     scheduler.plan()

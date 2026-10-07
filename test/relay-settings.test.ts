@@ -40,11 +40,13 @@ describe("relay settings", () => {
       assert.equal(lines.some((line) => line.includes("event=block-in ")), false)
       const api = first.apiEndpoint
       assert.ok(api)
-      const before = await fetch(`http://${api.host}:${api.port}/v0/stats`)
+      const before = await fetch(`http://${api.host}:${api.port}/v1/stats`)
       assert.equal(before.status, 200)
+      assert.equal(before.headers.get("access-control-allow-origin"), null, "the relay API is not for browsers")
       assert.deepEqual(await before.json(), first.snapshot())
-      const missing = await fetch(`http://${api.host}:${api.port}/v0/other`)
+      const missing = await fetch(`http://${api.host}:${api.port}/v1/other`)
       assert.equal(missing.status, 404)
+      assert.equal((await fetch(`http://${api.host}:${api.port}/v0/stats`)).status, 404)
 
       const sessionId = randomBytes(16)
       const data = encodeData({
@@ -61,7 +63,7 @@ describe("relay settings", () => {
       await sendUdp(socket, encodeEnvelope({ host: "127.0.0.1", port: 9 }, data), bound)
       await sendUdp(socket, encodeEnvelope({ host: "127.0.0.1", port: 9 }, ack), bound)
       await sleep(40)
-      const live = await fetch(`http://${api.host}:${api.port}/v0/stats`)
+      const live = await fetch(`http://${api.host}:${api.port}/v1/stats`)
       const body = (await live.json()) as { relays: number; bytes: number; transfers: number }
       assert.equal(body.transfers, 1)
       assert.ok(body.bytes > 0)
@@ -118,7 +120,7 @@ describe("relay settings", () => {
       await sendUdp(socket, Buffer.from("nope"), bound)
       await sendUdp(socket, encodeEnvelope({ host: "8.8.8.8", port: 9 }, data), bound)
       await sleep(40)
-      const response = await fetch(`http://${api.host}:${api.port}/v0/relay`)
+      const response = await fetch(`http://${api.host}:${api.port}/v1/relay`)
       assert.equal(response.status, 200)
       const body = (await response.json()) as {
         uptimeMs: number
@@ -378,7 +380,7 @@ describe("relay settings", () => {
       await joiner.join(bound)
       await joiner.publishUsage()
       await sleep(20)
-      const live = (await (await fetch(`http://${api.host}:${api.port}/v0/peers`)).json()) as {
+      const live = (await (await fetch(`http://${api.host}:${api.port}/v1/peers`)).json()) as {
         relays: Array<{ id: string; online: boolean; seq?: number }>
       }
       assert.equal(live.relays.length, 2)
@@ -388,7 +390,7 @@ describe("relay settings", () => {
       assert.equal(live.relays[1]?.online, true)
       assert.equal("seq" in (live.relays[1] ?? {}), false)
       await sleep(50)
-      const later = (await (await fetch(`http://${api.host}:${api.port}/v0/peers`)).json()) as {
+      const later = (await (await fetch(`http://${api.host}:${api.port}/v1/peers`)).json()) as {
         relays: Array<{ id: string; online: boolean }>
       }
       assert.equal(later.relays[0]?.id, seedId.id)

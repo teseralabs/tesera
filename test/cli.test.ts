@@ -281,16 +281,6 @@ describe("cli", () => {
     assert.match(proc.errors(), /--log-level/)
   })
 
-  it("refuses joined relays for a loopback api and a bad udp port range", async () => {
-    const loopback = start(["api", "--listen", "127.0.0.1:0", "--prefer-joined"])
-    assert.notEqual(await stopped(loopback), 0)
-    assert.match(loopback.errors(), /--prefer-joined needs --advertise/)
-
-    const ports = start(["api", "--listen", "127.0.0.1:0", "--udp-ports", "4463-4400"])
-    assert.notEqual(await stopped(ports), 0)
-    assert.match(ports.errors(), /port range/)
-  })
-
   it("rejects open access without an identity and keeps it for private relays", async () => {
     const open = start(["relay", "--listen", "127.0.0.1:0", "--access", "open"])
     assert.notEqual(await stopped(open), 0)
@@ -303,5 +293,88 @@ describe("cli", () => {
     } finally {
       await stop(plain)
     }
+  })
+
+  it("refuses removed flags instead of ignoring them", async () => {
+    for (const [args, message] of [
+      [["relay", "--listen", "127.0.0.1:0", "--browser", ":4433"], /--browser is now --webtransport/],
+      [["relay", "--listen", "127.0.0.1:0", "--browser-cert", "c.pem"], /--browser-cert is now --webtransport-cert/],
+      [["api", "--listen", "127.0.0.1:0", "--udp-ports", "4400-4401"], /--udp-ports was for the removed \/v0 transfer API/],
+    ] as const) {
+      const proc = start([...args])
+      assert.equal(await stopped(proc), 1)
+      assert.match(proc.errors(), message)
+      assert.doesNotMatch(proc.output(), /event=listen/)
+    }
+  })
+
+  it("refuses --webtransport, --allow, --block, and --policy-file without an identity", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tesera-policy-"))
+    try {
+      const policy = join(dir, "policy.json")
+      for (const [flag, value] of [
+        ["--allow", `relay:${"a".repeat(52)}`],
+        ["--block", `relay:${"a".repeat(52)}`],
+        ["--policy-file", policy],
+      ] as const) {
+        const proc = start(["relay", "--listen", "127.0.0.1:0", flag, value])
+        assert.equal(await stopped(proc), 1)
+        assert.match(proc.errors(), new RegExp(`${flag} decides which relays may join, so it needs --identity`))
+        assert.doesNotMatch(proc.output(), /event=listen/)
+      }
+      const browser = start(["relay", "--listen", "127.0.0.1:0", "--webtransport", "127.0.0.1:0"])
+      assert.equal(await stopped(browser), 1)
+      assert.match(browser.errors(), /--webtransport needs --identity/)
+      assert.doesNotMatch(browser.output(), /event=(listen|webtransport-listen)/)
+      const kept = start(["relay", "--listen", "127.0.0.1:0", "--identity", "33".repeat(32), "--policy-file", policy])
+      try {
+        await waitFor(kept, "role=relay event=listen", 3000)
+      } finally {
+        await stop(kept)
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("cli help", () => {
+  const commands = ["session", "id", "relay", "info", "allow", "block", "unblock", "forget", "api", "send", "recv", "stats"]
+
+  it("lists every command", async () => {
+    for (const args of [["--help"], ["-h"], ["help"], []]) {
+      const proc = start(args)
+      assert.equal(await stopped(proc), 0)
+      for (const name of commands) assert.match(proc.output(), new RegExp(`^  ${name} `, "m"))
+    }
+  })
+
+  it("prints each command's help and does nothing else", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tesera-help-"))
+    try {
+      for (const name of commands) {
+        for (const args of [[name, "--help"], [name, "-h"], ["help", name], [name, "--out", join(dir, "id"), "--help"]]) {
+          const proc = spawn(process.execPath, [cliPath, ...args], { stdio: ["ignore", "pipe", "pipe"], cwd: dir })
+          let out = ""
+          let err = ""
+          proc.stdout.on("data", (chunk: Buffer) => (out += chunk.toString()))
+          proc.stderr.on("data", (chunk: Buffer) => (err += chunk.toString()))
+          const code = await new Promise<number | null>((resolve) => proc.once("exit", resolve))
+          assert.equal(code, 0, `${args.join(" ")}: ${err}`)
+          assert.equal(err, "", `${args.join(" ")} wrote to stderr`)
+          assert.ok(out.startsWith(`tesera ${name}`), `${args.join(" ")} printed ${out}`)
+          assert.doesNotMatch(out, /secret [0-9a-f]{64}|session:[0-9a-f]{64}|relay:[a-z2-7]{52}|event=listen/)
+        }
+      }
+      await assert.rejects(stat(join(dir, "id")), "tesera id --help wrote an identity")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("refuses help for an unknown command", async () => {
+    const proc = start(["peers", "--help"])
+    assert.equal(await stopped(proc), 1)
+    assert.match(proc.errors(), /unknown command peers\. run tesera --help/)
   })
 })

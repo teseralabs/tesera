@@ -14,6 +14,25 @@ anyone can run a relay and contribute bandwidth to tesera. because the data is e
 
 [tesera.net](https://tesera.net)
 
+## the parts
+
+tesera is open-source software: a protocol, relays, a CLI, and a JavaScript client. this repository has all of them
+
+- **relays** carry tesserae over UDP. anyone can run one with `tesera relay`. this is the data plane
+- **attachment relays** are relays started with `--webtransport`. they also accept attachments over WebTransport, since a browser can't send UDP, and pass an endpoint's tesserae on to other relays. an attachment relay is still an ordinary relay, and can carry a coded path
+- **a control plane** is `tesera api`. its `/v1` API lists relays, which is discovery, and passes one offer and one answer between the 2 ends of a transfer, in a room. it never carries file data
+- **@tesera/client** is the JavaScript library applications use to send and receive over tesera, in a browser or Node.js, see [packages/client](packages/client)
+- **the CLI** sends and receives files from a terminal with `tesera send` and `tesera recv`
+
+tesera labs runs tesera.net, the transfer page built on @tesera/client, api.tesera.net, the control plane that page uses, and relay.tesera.net, the bootstrap relay other relays join. you can run every part yourself
+
+```text
+page ── WebTransport ── attachment relay ──┬── relay ──┐
+                                           ├── relay ──┼── attachment relay ── WebTransport ── page
+                                        └── relay ──┘
+          control plane: discovery and rooms, no file data
+```
+
 ## how it works
 
 tesera splits a stream into blocks. each block is encrypted and then coded into redundant pieces called tesserae
@@ -32,6 +51,10 @@ if one tessera is lost, delayed, or its path becomes unavailable, the receiver c
 
 a single coded piece is called a tessera. the plural is tesserae
 
+each tessera of a block takes a different relay, a coded path. a transfer can lose one of its 3 coded paths and continue
+
+that's redundancy across coded paths, not across everything. a browser reaches tesera through one attachment relay, and if that relay goes offline, its transfer stops. the coded paths can also share an operator, a machine, or a network, because tesera doesn't measure or choose relays for that yet
+
 ## why
 
 erasure coding and multipath transmission already exist. tesera is experimenting with what happens when they become the normal way of moving a stream of data
@@ -44,26 +67,27 @@ more paths aren't always better. paths can share the same bottleneck, experience
 
 tesera is still experimental. transfers are encrypted, but the code has not been independently audited
 
-don't send anything you need to keep private or secure
+don't rely on tesera yet for sensitive or critical data
 
-## v0
+## limitations
 
-this repository contains the current v0 research implementation
+this repository contains the current research implementation
 
 right now:
 
-- you run the relays yourself
+- relays are run by whoever starts them, and the network is small
 - one reachable seed can introduce relays that have joined it
 - relay discovery only goes one hop
 - NAT traversal is not implemented
 - the wire currently uses IPv4
 - tesera looks up a hostname once and then uses that IPv4 address
+- Safari hasn't been tested with @tesera/client or the transfer page
 
 a seed only knows about itself and the relays that joined it. statistics reported by a seed are its view of the network, not a count of every tesera relay that may exist
 
 ## security
 
-v0 is unaudited
+tesera is unaudited
 
 each transfer derives its own encryption and control keys, and transferred blocks are encrypted and authenticated with ChaCha20-Poly1305
 
@@ -73,12 +97,20 @@ tesera does not provide anonymity. relays and other network observers may still 
 
 a session secret created by `tesera session` has to be shared through a channel you already trust. tesera does not currently provide a way to exchange that secret for you
 
+with @tesera/client, as on the tesera.net transfer page, the secret is made on the sending device and travels to the receiver in the link's fragment, which browsers keep out of every request. relays, the control plane, and the web server never receive it, and see the files only as ciphertext
+
+a changed tessera is caught before anything is written, and today it stops the transfer, it can't change the file
+
+room answers aren't authenticated yet, so someone who learns a room id can join before the real receiver. they can't read the transfer, but the real receiver can't join it anymore
+
+[SECURITY.md](SECURITY.md) lists the security-sensitive parts and how to report a problem
+
 ## install
 
-requires Node.js 20 or newer
+the CLI and ordinary relays need Node.js 20 or newer
 
 ```bash
-npm install
+npm ci
 npm test
 npm run build
 ```
@@ -91,7 +123,23 @@ the CLI can be run with:
 npm run tesera -- …
 ```
 
-`tesera --help` lists the available commands
+`tesera --help` lists the commands, and `tesera COMMAND --help` describes one
+
+### for an attachment relay
+
+`--webtransport` needs the optional packages `@fails-components/webtransport` and `@fails-components/webtransport-transport-http3-quiche`. install them on Node.js 20.17 or newer. tesera labs runs its relays on Node.js 22
+
+on older Node.js 20 releases, npm skips them without an error. a relay without them still runs as an ordinary relay, and refuses to start with `--webtransport`
+
+the transport downloads a prebuilt binary for:
+
+- Linux on x64 or arm64, with glibc 2.38 or newer
+- macOS 26 or newer on arm64, or macOS 15 or newer on x64
+- Windows on x64
+
+on any other platform it builds from source, which needs git, CMake, and a C++ compiler, and can take more than 20 minutes
+
+on Linux with an older glibc, such as Debian 12, the prebuilt binary still installs but can't load, so the relay refuses `--webtransport`. Ubuntu 24.04 and Debian 13 are new enough
 
 ## run a relay
 
@@ -153,6 +201,34 @@ joining a seed on another machine needs `--allow-remote`
 if the first join fails, the relay tries again for 60 seconds, then exits with an error
 
 once joined, the relay reads the seed's signed peer table every minute. if the seed no longer lists it, the relay joins again, looking the hostname up again first. while the seed doesn't answer, the checks slow down to one every 5 minutes
+
+### attachment relays
+
+an attachment relay is an ordinary relay that also accepts attachments over WebTransport, from browsers and other clients. it needs the optional packages in [for an attachment relay](#for-an-attachment-relay)
+
+```bash
+npm run tesera -- relay \
+  --listen 0.0.0.0:4101 \
+  --allow-remote \
+  --identity relay.secret \
+  --advertise 203.0.113.10:4101 \
+  --webtransport :4433 \
+  --api 127.0.0.1:4180
+```
+
+`--webtransport HOST:PORT` is the UDP port clients reach over HTTP/3. open it in the firewall alongside `--listen`
+
+`--identity` is required, because the relay signs a statement of what it serves with that key. `--advertise` is the UDP address other relays and the control plane reach it at
+
+without `--webtransport-cert` and `--webtransport-key`, the relay makes its own 10-day self-signed certificates and rotates them. the next one is published days before the switch, so browsers that pinned both keep connecting
+
+`GET /v1/transports` on the relay's `--api` returns the signed statement: the WebTransport certificate hashes and attach version. a control plane reads it there
+
+browsers find an attachment relay once a control plane lists it in its entries file, see [control plane](#control-plane)
+
+if the WebTransport packages are missing, or the listener can't start, the relay exits with an error. it never signs a statement for a listener that isn't running
+
+an attachment relay forwards each of its attachments' tesserae and the acknowledgements coming back, so it needs a higher `--bandwidth` than a relay that only carries coded paths, see [operator policy](#operator-policy)
 
 ## relay options
 
@@ -268,7 +344,7 @@ a valid signature and a reachable address are separate checks. a record can have
 
 `--json` returns the signed packet and the fields decoded from that packet
 
-`GET /v0/record` on the relay API returns the same signed record
+`GET /v1/record` on the relay API returns the same signed record
 
 ### operator policy
 
@@ -281,17 +357,21 @@ a relay starts private and with lower limits. this keeps a new relay from immedi
 by default, a relay is limited to:
 
 ```text
-bandwidth        5 mbps
+bandwidth        5 megabits per second
 sessions         8
 new peers        6 per minute
 datagrams        2000 per second
 ```
 
-the bandwidth limit is shared across all traffic forwarded by the relay
+bandwidth is counted in bits, so 5 megabits is about 625,000 bytes a second. it counts whole forwarded datagrams, tessera data and control alike, without IP and UDP headers, and it's shared by every transfer through the relay
 
-the datagram limit counts every forwarded datagram, including samples, acknowledgements, and negative acknowledgements. a 1-of-1 block costs a relay about 3 datagrams, so 2000 per second leaves room for the 5 mbps limit
+the datagram limit counts every forwarded datagram too, including samples, acknowledgements, and negative acknowledgements
 
 a dropped datagram looks like loss to the sender, which slows down and sends again later
+
+for scale, one measurement: a 20 MB `tesera send` over 3 relays on these defaults, all on one machine over loopback, ran at about 1.20 MB/s of file data. each relay forwarded about 10.7 MB, and about 9% of datagrams were dropped at the limit. that's one run, not a promise
+
+an attachment relay forwards everything its attachments send, so with the defaults, a browser sender behind it gets well under 625,000 bytes a second. give attachment relays a higher `--bandwidth`
 
 a bare bandwidth value is treated as megabits per second. values can also include a unit, such as `500kbps` or `50mbps`. use `0` to remove the limit
 
@@ -336,6 +416,8 @@ peers can also be allowed or blocked when starting a relay:
 --allow relay:ID
 --block relay:ID
 ```
+
+`--allow`, `--block`, and `--policy-file` decide which relays may join, so a relay refuses them without `--identity`, since a relay without an identity can't answer joins
 
 ### where packets may go
 
@@ -392,16 +474,21 @@ npm run tesera -- relay \
   --api 127.0.0.1:4180
 ```
 
-there are currently four endpoints:
+there are currently 5 endpoints:
 
 ```text
-GET /v0/stats
-GET /v0/relay
-GET /v0/peers
-GET /v0/record
+GET /v1/stats
+GET /v1/relay
+GET /v1/peers
+GET /v1/record
+GET /v1/transports
 ```
 
-`/v0/stats` returns the seed's current snapshot:
+they are for the operator and the control plane, not for browsers, so they send no CORS headers
+
+`/v1/transports` lists the relay's signed transport statements, empty unless it's a running [attachment relay](#attachment-relays)
+
+`/v1/stats` returns the seed's current snapshot:
 
 ```json
 {
@@ -411,11 +498,11 @@ GET /v0/record
 }
 ```
 
-`/v0/relay` describes only the current relay process, including uptime, forwarded datagrams and bytes, data frames, acknowledgements, negative acknowledgements, repeated tesserae, and datagrams that were refused or could not be parsed
+`/v1/relay` describes only the current relay process, including uptime, forwarded datagrams and bytes, data frames, acknowledgements, negative acknowledgements, repeated tesserae, and datagrams that were refused or could not be parsed
 
 `limited` counts datagrams an operator limit dropped. `limitedBy` splits that count by `session`, `datagram`, `bandwidth`, `destination`, and `table`. the relay also prints `event=limited` with the same split at most every 30 seconds while drops continue
 
-`/v0/peers` lists the relays this seed knows. each one has its id, address, whether it is online, when it was last heard, and the bytes and transfers it reported
+`/v1/peers` lists the relays this seed knows. each one has its id, address, whether it is online, when it was last heard, and the bytes and transfers it reported
 
 a quiet relay stays in that list and is marked offline. `seen` is milliseconds since the epoch
 
@@ -435,7 +522,7 @@ a quiet relay stays in that list and is marked offline. `seen` is milliseconds s
 }
 ```
 
-`GET /v0/record` returns this relay's signed record when the relay has an identity
+`GET /v1/record` returns this relay's signed record when the relay has an identity
 
 `packet` contains the complete signed record as base64
 
@@ -451,7 +538,7 @@ a quiet relay stays in that list and is marked offline. `seen` is milliseconds s
     "ttl": 86400,
     "wire": 2,
     "implementation": "tesera",
-    "software": "0.2.1-beta",
+    "software": "0.3.0-beta",
     "build": "",
     "manifest": "",
     "capabilities": ["discover", "forward"],
@@ -471,7 +558,7 @@ the signature proves that the relay identity created the record and made the cla
 
 a program that relies on these claims should verify `packet` and use the fields decoded from the verified packet rather than trusting `record` on its own
 
-without an identity, `/v0/record` returns `404`
+without an identity, `/v1/record` returns `404`
 
 if only software on the same machine needs the API, bind it to loopback
 
@@ -491,6 +578,14 @@ SESSION=$(npm run tesera -- session)
 ```
 
 share this secret with the other person through a channel you already trust
+
+a session secret contains 32 random bytes, encoded as 64 hexadecimal characters
+
+it can also be made with openssl:
+
+```bash
+echo "session:$(openssl rand -hex 32)"
+```
 
 the receiver can then listen for the transfer:
 
@@ -532,30 +627,54 @@ when only one relay is available, use:
 --k 1 --n 1
 ```
 
-## public api
+## control plane
 
-`tesera api` exposes send and receive over HTTP, allowing another program to use tesera without opening its own UDP sockets
+`tesera api` is the control plane applications use with [@tesera/client](packages/client). tesera labs runs one at `api.tesera.net`, as a beta service with no availability promise
 
-start an API server with:
+```text
+GET    /
+GET    /v1/relays
+POST   /v1/rooms
+GET    /v1/rooms/ROOM
+DELETE /v1/rooms/ROOM
+POST   /v1/rooms/ROOM/answer
+GET    /v1/rooms/ROOM/answer
+```
+
+`GET /` returns a JSON description of the control plane, its version, wire version, endpoints, and documentation URL
+
+`/v1/relays` is discovery. it lists the seed's UDP relays, each confirmed by a handshake with its identity key, and the attachment relays in `--entries`, each with a WebTransport statement the relay signed
+
+`/v1/rooms` holds one offer and one answer, so 2 endpoints can find each other. a room lasts 10 minutes, and the first answer wins
+
+the offer holds a session id, the sender's address, the relays, the coding, and the size. the secret isn't part of it. it stays with the 2 endpoints, in the link's fragment
+
+file data never goes through the control plane. it goes between the endpoints and relays. there is no `/v1/send`: an application sends with @tesera/client, which encrypts on the device
+
+an entries file lists the attachment relays to offer:
+
+```json
+{
+  "entries": [
+    {
+      "relay": "relay:ID",
+      "url": "https://edge.example.net:4433",
+      "statement": "http://127.0.0.1:4180/v1/transports"
+    }
+  ]
+}
+```
+
+`statement` is where the control plane reads that relay's `/v1/transports`. an entry whose statement doesn't verify against its relay id isn't listed
 
 ```bash
 npm run tesera -- api \
   --listen 127.0.0.1:4190 \
-  --discover relay.tesera.net \
-  --advertise 127.0.0.1
+  --discover relay:ID@203.0.113.10:4101 \
+  --entries entries.json
 ```
 
-`--listen` is the address the HTTP API listens on
-
-`--discover` sets the default seed used to find relays. the seed contributes itself and the relays that have joined it
-
-`--advertise` is the IPv4 address relays use to send data back to this tesera instance. when relays are running on other machines, this needs to be an address they can reach
-
-`--udp-ports` keeps the API's UDP sockets inside one range, such as `4400-4463`, so a firewall only needs to open that range. each transfer uses 2 ports. without it each socket takes a random port. a transfer that finds no free port gets `503 busy`
-
-`--prefer-joined` is for an API on the same machine as its `--discover` seed. a call that names no relays uses up to 3 relays that joined the seed, different hosts first, when 2 or more answer. if that fails, it tries once more through the seed alone with what is left of the deadline. with fewer than 2 joined relays it uses the seed. it needs an `--advertise` address the joined relays can reach
-
-if other programs or computers need to use the API, the listen address can be published somewhere reachable, for example `api.tesera.net`
+`--discover` sets the seed whose relays `/v1/relays` lists. the seed contributes itself and the relays that have joined it
 
 `--trust-proxy` names a loopback reverse proxy on this machine, such as `127.0.0.1`. a request may take its client address from `X-Forwarded-For` only when the socket peer is that proxy. the address used is the rightmost hop that is not itself a trusted proxy
 
@@ -565,148 +684,7 @@ keep this API listening on loopback, so the only program that can connect is tha
 
 `api.tesera.net` reaches this process through Caddy on `127.0.0.1`, so that server needs `--trust-proxy 127.0.0.1`
 
-### endpoints
-
-```text
-POST /v0/send
-POST /v0/receive
-GET  /v0/record
-GET  /v0/stats
-GET  /v0/peers
-```
-
-`GET /` returns a JSON description of the public API, its version, wire version, endpoints, and documentation URL
-
-`POST /v0/send` sends the raw request body through tesera
-
-`POST /v0/receive` waits for a transfer and returns the received bytes as the response body
-
-`GET /v0/record` returns the signed record of the API server's seed
-
-`packet` is that record, base64-encoded. `record` is decoded from `packet`
-
-`GET /v0/stats` returns the seed's relay count, the bytes those relays have forwarded, and the transfers they have completed
-
-`GET /v0/peers` lists the relays that seed introduces. each one has its id, host, and port
-
-`GET /v0/record`, `GET /v0/stats`, and `GET /v0/peers` need no session header
-
-the receiver has to be waiting while the sender sends
-
-### sessions
-
-the sender and receiver use the same session secret:
-
-```text
-x-tesera-session: session:<64 hex characters>
-```
-
-a session secret contains 32 random bytes, encoded as 64 hexadecimal characters
-
-generate one with tesera:
-
-```bash
-npm run tesera -- session
-```
-
-or generate one directly with openssl:
-
-```bash
-echo "session:$(openssl rand -hex 32)"
-```
-
-the session secret has to be shared with the other side through a channel you already trust. tesera does not exchange it for you
-
-anyone with the session secret may be able to participate in that session, so treat it as private
-
-### relays
-
-when no relays are specified, a call discovers them through the API server's default seed
-
-specific relays can be provided with `x-tesera-relays` as a comma-separated list:
-
-```text
-x-tesera-relays: relay:ID@host:port,relay:ID@host:port
-```
-
-a different seed can be used for one call with:
-
-```text
-x-tesera-discover: relay.example.net
-```
-
-the sender and receiver need to use the same relays
-
-### send
-
-the request body is the data being transferred
-
-for example:
-
-```bash
-curl -X POST http://127.0.0.1:4190/v0/send \
-  -H "x-tesera-session: $SESSION" \
-  --data-binary @file.bin
-```
-
-a successful send returns JSON:
-
-```json
-{
-  "bytes": 12,
-  "relays": 1,
-  "tesserae": 3,
-  "retransmits": 0,
-  "acks": 1
-}
-```
-
-### receive
-
-a receiver waits for data using the same session secret:
-
-```bash
-curl -X POST http://127.0.0.1:4190/v0/receive \
-  -H "x-tesera-session: $SESSION" \
-  --output file.bin
-```
-
-the response body contains the received bytes
-
-transfer information is returned in these response headers:
-
-```text
-x-tesera-bytes
-x-tesera-relays
-x-tesera-tesserae
-x-tesera-retransmits
-x-tesera-acks
-```
-
-### transfer options
-
-send accepts the same main transfer settings as `tesera send`:
-
-```text
-x-tesera-k
-x-tesera-n
-x-tesera-shard
-x-tesera-window
-x-tesera-max-sends
-x-tesera-retx-after-ms
-```
-
-receive also accepts:
-
-```text
-x-tesera-nack-after-ms
-```
-
-if these aren't provided, the defaults match `tesera send` and `tesera recv`
-
-`x-tesera-deadline-ms` controls how long a send or receive call can wait
-
-the default is `60000` ms. values from `1000` to `180000` ms are accepted
+the control plane's `/v1` and a relay's `--api` `/v1` are separate APIs that may change version separately. neither is the wire protocol version, the attach version, the statement version, or the `v` in a discovery document
 
 ### errors
 
@@ -714,73 +692,49 @@ failed requests return JSON:
 
 ```json
 {
-  "error": "session"
+  "error": "not_found"
 }
 ```
 
 possible error codes are:
 
 ```text
-session
-relays
-option
-empty
-size
-in_use
-busy
-rate_limit
-timeout
-transfer
-record
-stats
-peers
 method
 not_found
+room
+document
+option
+size
+token
+answered
+session
+busy
+rate_limit
+unavailable
 ```
+
+`not_found` means the room is unknown, closed, or expired. `answered` means another receiver answered first. `busy` means the control plane holds as many rooms as it allows
 
 `rate_limit` means the caller has exceeded a public API limit. the response uses HTTP 429 and includes `Retry-After` when the server knows when the allowance will become available again
 
-`busy` means the API process has reached its global transfer capacity
-
 ### limits
 
-a payload can currently be up to 25 MB
-
-the public API also limits request rate, transfer bandwidth, and concurrent transfers so that one caller cannot consume the whole service
+the public API limits request rate so that one caller cannot consume the whole service
 
 the current anonymous limits are:
 
-- 30 transfer requests per minute per IP
-- 100 MB of transfer data per minute per IP
-- 4 active transfers per IP
-- 32 active transfers across the API process
-- 120 informational requests per minute per IP
+- 120 requests per minute per IP
+- 10 new rooms per minute per IP
 
-`GET /`, `GET /v0/record`, `GET /v0/stats`, and `GET /v0/peers` use the informational request limit and do not consume the transfer-data allowance
-
-when a caller reaches one of its limits, the API returns HTTP 429 with `{"error":"rate_limit"}`. `Retry-After` tells the caller how long to wait when that information is available
-
-these are public v0 service limits and may change
+these are public service limits and may change
 
 ### access
 
 the tesera public API does not currently require an account or API key
 
-`x-tesera-session` is a transfer secret, not an API credential. changing the session does not change or reset a caller's public API limits
+room responses are returned with `Cache-Control: no-store`
 
-### security
-
-the API process is an endpoint of the transfer. it can see both the original bytes and the session secret
-
-session secrets should not be included in application logs. transfer responses and session-related errors are returned with `Cache-Control: no-store`
-
-relays used to carry the transfer only receive encrypted data rather than the original plaintext. each transfer derives its own encryption and control keys, and transferred blocks are encrypted and authenticated with ChaCha20-Poly1305
-
-tesera does not provide anonymity. relays and other network observers may still be able to see metadata about a transfer, including addresses, timing, and traffic volume
-
-by default, keep the API bound to `127.0.0.1`. exposing it to other machines gives those machines access to the tesera API and should only be done intentionally
-
-tesera v0 is experimental and unaudited. don't use the public API to transfer anything you need to keep private or secure
+running it yourself is covered in [packages/client](packages/client#running-your-own)
 
 ## license
 

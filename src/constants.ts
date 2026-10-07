@@ -31,6 +31,14 @@ export const ENVELOPE_LEN = 11
  * A peer table is larger and is not a forwarded frame, so this ceiling does not apply to it.
  */
 export const MAX_FORWARD_DATAGRAM = ENVELOPE_LEN + DATA_HEADER_LEN + MAX_SHARD + CRC_LEN
+/** Envelope, data header, and CRC around one shard. A data datagram is this plus the shard. */
+export const DATAGRAM_OVERHEAD = ENVELOPE_LEN + DATA_HEADER_LEN + CRC_LEN
+/** The largest shard whose data datagram fits in `maxPacketSize`, clamped to the protocol maximum. */
+export function shardForPacketSize(maxPacketSize: number): number {
+  const shard = Math.min(MAX_SHARD, maxPacketSize - DATAGRAM_OVERHEAD)
+  if (shard < 1) throw new Error(`transport packet limit ${maxPacketSize} is too small for a tesera datagram`)
+  return shard
+}
 /** Bytes forwarded to one address before it sends a valid tesera datagram back. */
 export const UNVERIFIED_DEST_BYTES = 8192
 /** Unverified and verified destinations remembered at once. */

@@ -125,6 +125,11 @@ export function isIdentityPacket(packet: Uint8Array): boolean {
   return kind !== null && IDENTITY_KINDS.has(kind)
 }
 
+/** True when the bytes begin with the identity magic, whatever the version or kind. A frame begins with the protocol version instead. */
+export function startsIdentity(packet: Uint8Array): boolean {
+  return packet.length >= ID_MAGIC.length && magicMatches(packet)
+}
+
 /** Versioned TSID header, or null when the packet is some other datagram. */
 export function identityKind(packet: Uint8Array): number | null {
   if (packet.length < HEADER_LEN || !magicMatches(packet) || packet[4] !== PROTOCOL_VERSION) return null

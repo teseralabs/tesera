@@ -1,6 +1,7 @@
 import { createServer, type Server, type ServerResponse } from "node:http"
 import type { Endpoint } from "../carrier/udp.js"
 import type { LimitedBy } from "../metrics.js"
+import type { SignedStatement } from "../attach/statement.js"
 import type { RecordDocument } from "../identity/record.js"
 import type { RelaySnapshot } from "../identity/stats.js"
 
@@ -42,6 +43,7 @@ export async function listenRelayApi(
     relay: () => RelayReport
     peers: () => RelayDirectory
     record?: () => RecordDocument | null
+    transports?: () => { statements: SignedStatement[] }
   },
 ): Promise<{ server: Server; endpoint: Endpoint }> {
   const server = createServer((req, res) => {
@@ -50,7 +52,7 @@ export async function listenRelayApi(
       sendJson(res, 405, { error: "method" })
       return
     }
-    if (path === "/v0/record") {
+    if (path === "/v1/record") {
       try {
         const doc = read.record?.() ?? null
         if (!doc) sendJson(res, 404, { error: "not_found" })
@@ -60,7 +62,16 @@ export async function listenRelayApi(
       }
       return
     }
-    const body = path === "/v0/stats" ? read.stats : path === "/v0/relay" ? read.relay : path === "/v0/peers" ? read.peers : null
+    const body =
+      path === "/v1/stats"
+        ? read.stats
+        : path === "/v1/relay"
+          ? read.relay
+          : path === "/v1/peers"
+            ? read.peers
+            : path === "/v1/transports"
+              ? (read.transports ?? (() => ({ statements: [] })))
+              : null
     if (!body) {
       sendJson(res, 404, { error: "not_found" })
       return
@@ -100,7 +111,6 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
-    "access-control-allow-origin": "*",
   })
   res.end(JSON.stringify(body))
 }

@@ -8,3 +8,6 @@ tmp/
 *.secret
 *.secret.record
 *.secret.record.tmp
+
+# local experiments, never shipped
+experiments/

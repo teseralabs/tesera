@@ -20,6 +20,7 @@ import {
   encodeQuery,
   formatId,
   isIdentityPacket,
+  startsIdentity,
   verifyProof,
   type Identity,
   type Proof,
@@ -53,13 +54,15 @@ import {
   isRecordAsk,
   type RecordClaims,
 } from "../identity/record.js"
-import { decodeEnvelope } from "../protocol/envelope.js"
+import { decodeEnvelope, startsEnvelope } from "../protocol/envelope.js"
 import { peekRelayFrame } from "../protocol/frames.js"
+import type { SignedStatement } from "../attach/statement.js"
 import { closeRelayApi, listenRelayApi, type ListedRelay, type RelayDirectory, type RelayReport } from "./api.js"
 import { readAnalytics, writeAnalytics } from "./analytics.js"
 import { readPeers, writePeers, type StoredPeer } from "./peers-file.js"
 import { DestBudget } from "./dest-budget.js"
 import { destinationAllowed, parseCidr, type Cidr } from "./dest.js"
+import type { ForwardResult, LocalDelivery } from "./local.js"
 import { fillPolicy, PolicyGate, readPolicy, writePolicy, type LimitReason, type OperatorPolicy } from "./policy.js"
 import { isStructuralTesera } from "./structural.js"
 import { DEFAULT_PEER_OFFLINE_MS, defaultRelaySettings, type RelaySettings } from "./config.js"
@@ -86,7 +89,7 @@ export type RelayOptions = {
   logLevel?: LogLevel
   /** When set, this relay's bytes and transfers are reloaded on the next start. */
   analyticsFile?: string
-  /** When set, GET /v0/stats is served on this TCP address. */
+  /** When set, the relay API is served on this TCP address. */
   api?: { host: string; port: number }
   /** How long a quiet relay stays remembered. Defaults to 30 days. */
   peerTtlMs?: number
@@ -112,6 +115,10 @@ export type RelayOptions = {
   recordFile?: string
   /** Shortest gap between `event=limited` lines. Defaults to 30 seconds. */
   limitLogMs?: number
+  /** Where to deliver packets that belong to a locally attached endpoint rather than a UDP peer. */
+  localDelivery?: LocalDelivery
+  /** Signed statements of the extra transports this relay serves, for GET /v1/transports. */
+  transportStatements?: () => SignedStatement[]
 }
 
 /** Shortest gap between two `event=limited` lines. */
@@ -189,6 +196,7 @@ export class Relay {
   private peersTimer: NodeJS.Timeout | null = null
   private policyTimer: NodeJS.Timeout | null = null
   private readonly gate: PolicyGate | null
+  private readonly localDelivery: LocalDelivery | null
   private readonly policyFile: string | null
   private readonly allowDest: Cidr[]
   private readonly dests: DestBudget
@@ -234,6 +242,7 @@ export class Relay {
       peersFile: opts.peersFile ?? defaults.peersFile,
     }
     this.gate = opts.policy ? new PolicyGate(fillPolicy(opts.policy)) : null
+    this.localDelivery = opts.localDelivery ?? null
     this.policyFile = opts.policyFile ?? null
     this.allowDest = (opts.allowDest ?? []).map(parseCidr)
     const destTtlMs = opts.destTtlMs ?? UNVERIFIED_DEST_TTL_MS
@@ -255,7 +264,15 @@ export class Relay {
     return this.bound
   }
 
-  /** TCP address of GET /v0/stats, after start. Null when the API is off. */
+  /** The address peers send to: the first advertised one, or the bound one unless that is every interface. */
+  get publicEndpoint(): Endpoint | null {
+    const advertised = this.opts.advertise?.[0]
+    if (advertised) return advertised
+    const bound = this.endpoint
+    return bound.host === "0.0.0.0" ? null : bound
+  }
+
+  /** TCP address of the relay API, after start. Null when the API is off. */
   get apiEndpoint(): Endpoint | null {
     return this.httpEndpoint
   }
@@ -548,6 +565,23 @@ export class Relay {
     }
     const env = decodeEnvelope(msg)
     if (!env) {
+      // A packet that isn't an envelope may still belong to a local endpoint, such as a return frame for an attachment.
+      if (this.localDelivery?.deliverReturn(msg, remote)) {
+        // A matched return frame proves this source is a real relay we forward to, even though a bare
+        // frame is not structural on its own, so reopen its destination budget directly.
+        this.markReturningDest(remote)
+        return
+      }
+      this.stats.droppedInvalid++
+      return
+    }
+    // Forwarding an inner envelope would chain relays and hide the frame's session from admission.
+    if (startsEnvelope(env.inner)) {
+      this.stats.droppedInvalid++
+      return
+    }
+    // A forwarded identity packet would reach the next relay as if this relay sent it, and start handshakes in its name.
+    if (startsIdentity(env.inner)) {
       this.stats.droppedInvalid++
       return
     }
@@ -607,6 +641,33 @@ export class Relay {
       forward()
     }, decision.waitMs)
     this.timers.add(timer)
+  }
+
+  /**
+   * Send `packet` to a relay destination `to` for a locally attached endpoint. The same
+   * destination policy, datagram size, and limits apply as to a forwarded UDP packet, so an
+   * attachment is not a way around them. This is the only path from a local endpoint to UDP,
+   * and it is never reached from a packet that arrived over UDP, so there is no second hop.
+   *
+   * A local endpoint forwards an ordinary tesera envelope, so the same hardening as a UDP
+   * forward applies: the packet must be an envelope, and its inner frame must be neither
+   * another envelope nor an identity packet, so an attachment cannot chain relays or start a
+   * handshake in this relay's name.
+   */
+  forwardForLocal(packet: Buffer, to: Endpoint): ForwardResult {
+    if (!this.socket || this.closed) return "closed"
+    if (packet.length > MAX_FORWARD_DATAGRAM) return "too-large"
+    if (!this.opts.allowRemote && !isLoopback(to.host)) return "denied"
+    if (this.opts.allowRemote && !destinationAllowed(to.host, this.allowDest)) return "denied"
+    const env = decodeEnvelope(packet)
+    if (!env) return "invalid"
+    if (startsEnvelope(env.inner)) return "invalid"
+    if (startsIdentity(env.inner)) return "invalid"
+    const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
+    if (this.gate?.admitDatagram(packet.length, session)) return "limited"
+    if (this.opts.allowRemote && !this.dests.spend(to, packet.length)) return "limited"
+    this.socket.send(packet, to.port, to.host)
+    return "ok"
   }
 
   /** Count frames this process forwarded, including a tessera sent through here again. */
@@ -762,13 +823,18 @@ export class Relay {
 
   private noteReturn(remote: Endpoint, msg: Buffer): void {
     if (!this.opts.allowRemote) return
+    if (!isStructuralTesera(msg)) return
+    this.markReturningDest(remote)
+  }
+
+  private markReturningDest(remote: Endpoint): void {
+    if (!this.opts.allowRemote) return
     let from: Endpoint
     try {
       from = { host: normalizeHost(remote.host), port: remote.port }
     } catch {
       return
     }
-    if (!isStructuralTesera(msg)) return
     this.dests.markReachable(from)
   }
 
@@ -1005,6 +1071,7 @@ export class Relay {
       relay: () => this.report(),
       peers: () => this.directory(),
       record: () => (this.recordPacket ? recordDocument(this.recordPacket) : null),
+      transports: () => ({ statements: this.opts.transportStatements?.() ?? [] }),
     })
     this.http = listened.server
     this.httpEndpoint = listened.endpoint

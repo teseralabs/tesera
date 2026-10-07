@@ -134,11 +134,22 @@ export class PathScheduler {
     return rtt * 3
   }
 
-  /** Relay a retransmission should use right now. */
+  /**
+   * Relay a retransmission should use right now. A path that died keeps its old round trip
+   * and sheds its queue with every miss, so it looks idle. A path that missed since its last
+   * answer is used only when every path has.
+   */
   best(): number {
     const extra = Array.from({ length: this.pathCount }, () => 0)
     const ceiling = this.bestBase() * 2
-    return this.pick(extra, (candidate) => this.base(candidate) <= ceiling) ?? this.pick(extra, () => true) ?? 0
+    const clear = (relay: number) => (this.strikes[relay] ?? 0) === 0
+    return (
+      this.pick(extra, (candidate) => clear(candidate) && this.base(candidate) <= ceiling) ??
+      this.pick(extra, clear) ??
+      this.pick(extra, (candidate) => this.base(candidate) <= ceiling) ??
+      this.pick(extra, () => true) ??
+      0
+    )
   }
 
   /** Returns the block id used to tell a shared failure from a split one. */

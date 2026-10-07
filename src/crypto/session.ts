@@ -1,5 +1,5 @@
-import { createCipheriv, createDecipheriv, createHmac, hkdfSync, timingSafeEqual } from "node:crypto"
 import { FRAME_DATA, INNER_HEADER_LEN, MAC_LEN, PROTOCOL_VERSION, SESSION_ID_LEN, TAG_LEN } from "../constants.js"
+import { chachaOpen, chachaSeal, constantTimeEqual, hkdfSha256, hmacSha256 } from "./primitives.js"
 
 export const SESSION_PREFIX = "session:"
 
@@ -50,8 +50,8 @@ export function deriveKeys(secret: Uint8Array, sessionId: Uint8Array): TrafficKe
   assertSession(secret)
   if (sessionId.length !== SESSION_ID_LEN) throw new Error("session id must be 16 bytes")
   return {
-    aeadKey: Buffer.from(hkdfSync("sha256", secret, sessionId, AEAD_INFO, 32)),
-    macKey: Buffer.from(hkdfSync("sha256", secret, sessionId, MAC_INFO, 32)),
+    aeadKey: hkdfSha256(secret, sessionId, AEAD_INFO, 32),
+    macKey: hkdfSha256(secret, sessionId, MAC_INFO, 32),
   }
 }
 
@@ -92,13 +92,11 @@ export function blockAad(ctx: BlockContext): Buffer {
 
 export function mac16(key: Uint8Array, data: Uint8Array): Buffer {
   assertSession(key)
-  return createHmac("sha256", key).update(data).digest().subarray(0, MAC_LEN)
+  return hmacSha256(key, data).subarray(0, MAC_LEN)
 }
 
 export function macMatches(key: Uint8Array, data: Uint8Array, mac: Uint8Array): boolean {
-  const expected = mac16(key, data)
-  if (mac.length !== expected.length) return false
-  return timingSafeEqual(expected, mac)
+  return constantTimeEqual(mac16(key, data), mac)
 }
 
 function nonceFor(blockId: number): Buffer {
@@ -133,10 +131,7 @@ export function seal(
   plain[0] = fin ? 1 : 0
   plain.writeBigUInt64BE(BigInt(sentAtMs), 1)
   plain.set(body, INNER_HEADER_LEN)
-  const cipher = createCipheriv("chacha20-poly1305", aeadKey, nonceFor(blockId), { authTagLength: TAG_LEN })
-  cipher.setAAD(aad, { plaintextLength: plain.length })
-  const encrypted = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()])
-  return encrypted
+  return chachaSeal(aeadKey, nonceFor(blockId), plain, aad, TAG_LEN)
 }
 
 export function open(
@@ -150,14 +145,7 @@ export function open(
   if (ciphertext.length < TAG_LEN + INNER_HEADER_LEN) {
     throw new Error("ciphertext too short")
   }
-  const tag = ciphertext.subarray(ciphertext.length - TAG_LEN)
-  const data = ciphertext.subarray(0, ciphertext.length - TAG_LEN)
-  const decipher = createDecipheriv("chacha20-poly1305", aeadKey, nonceFor(blockId), {
-    authTagLength: TAG_LEN,
-  })
-  decipher.setAuthTag(tag)
-  decipher.setAAD(aad, { plaintextLength: data.length })
-  const plain = Buffer.concat([decipher.update(data), decipher.final()])
+  const plain = chachaOpen(aeadKey, nonceFor(blockId), ciphertext, aad, TAG_LEN)
   const sentAtMs = Number(plain.readBigUInt64BE(1))
   return {
     fin: ((plain[0] ?? 0) & 1) === 1,

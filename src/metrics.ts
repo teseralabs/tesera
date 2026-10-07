@@ -50,6 +50,12 @@ export type SenderStats = {
   tesseraRetransmissions: number
   encryptMs: number
   encodeMs: number
+  /** Round trips from a tessera's send to its sample, summed, for a mean. Diagnostics only. */
+  sampleRttSumMs: number
+  sampleRttCount: number
+  /** The open window, in blocks, at each block ACK, summed, for a mean. Diagnostics only. */
+  windowSum: number
+  windowCount: number
 }
 
 export function emptySenderStats(): SenderStats {
@@ -61,6 +67,10 @@ export function emptySenderStats(): SenderStats {
     tesseraRetransmissions: 0,
     encryptMs: 0,
     encodeMs: 0,
+    sampleRttSumMs: 0,
+    sampleRttCount: 0,
+    windowSum: 0,
+    windowCount: 0,
   }
 }
 
@@ -78,6 +88,8 @@ export type ReceiverStats = {
   latencySumMs: number
   latencyCount: number
   maxBlockLatencyMs: number
+  /** Most delivered bytes waiting for `read` at once. */
+  maxUnreadBytes: number
 }
 
 export function emptyReceiverStats(): ReceiverStats {
@@ -95,6 +107,7 @@ export function emptyReceiverStats(): ReceiverStats {
     latencySumMs: 0,
     latencyCount: 0,
     maxBlockLatencyMs: 0,
+    maxUnreadBytes: 0,
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "tesera",
-  "version": "0.2.1-beta",
+  "version": "0.3.0-beta",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
@@ -8,13 +8,18 @@
     "tesera": "dist/src/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node --test dist/test",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
     "tesera": "node dist/src/cli.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.6.3"
+  },
+  "optionalDependencies": {
+    "@fails-components/webtransport": "1.6.8",
+    "@fails-components/webtransport-transport-http3-quiche": "^1.6.8"
   },
   "engines": {
     "node": ">=20"

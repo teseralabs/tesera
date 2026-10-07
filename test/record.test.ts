@@ -219,7 +219,7 @@ describe("relay record", () => {
       assert.equal("bytes" in doc.record, false)
       const api = advertised.apiEndpoint
       assert.ok(api)
-      const response = await fetch(`http://${api.host}:${api.port}/v0/record`)
+      const response = await fetch(`http://${api.host}:${api.port}/v1/record`)
       assert.equal(response.status, 200)
       const body = (await response.json()) as { packet: string; record: { seq: string; name: string } }
       assert.equal(body.packet, packet.toString("base64"))

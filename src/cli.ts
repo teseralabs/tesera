@@ -3,9 +3,9 @@ import { createHash, randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
 import { open, readFile, writeFile } from "node:fs/promises"
 import { resolve } from "node:path"
-import { parsePortRange } from "./carrier/ports.js"
 import { DEFAULT_RELAY_PORT, resolveEndpoint, resolveRelayRef, splitRelayRef } from "./carrier/resolve.js"
 import { listenPublicApi } from "./api/public.js"
+import { Discovery, readEntries } from "./control/discovery.js"
 import { isLoopback, normalizeHost, parseEndpoint, parseListen, type Endpoint } from "./carrier/udp.js"
 import { confirmRelay } from "./identity/confirm.js"
 import { identityFromSecret, generateIdentity, type Identity } from "./identity/id.js"
@@ -29,19 +29,116 @@ import { TeseraReceiver } from "./transport/receiver.js"
 import { TeseraSender } from "./transport/sender.js"
 import { asError } from "./util.js"
 
-const HELP = `tesera session
-tesera id [--out FILE]
-tesera relay --listen 0.0.0.0:4101 [--identity FILE] [--join [relay:ID@]relay.tesera.net] [--allow-remote] [--allow-dest CIDR] [--advertise HOST:PORT] [--name TEXT] [--record-file FILE] [--record-ttl SECONDS] [--access private] [--bandwidth 5mbps] [--max-sessions 8] [--peer-rate 6] [--datagram-rate 2000] [--policy-file FILE] [--allow RELAY] [--block RELAY] [--log-level info] [--metrics-file FILE] [--peers-file FILE] [--api HOST:PORT] [--peer-ttl 30d]
-tesera info relay:ID@host:port [--json]
-tesera allow RELAY --policy-file FILE
-tesera block RELAY --policy-file FILE
-tesera unblock RELAY --policy-file FILE
-tesera forget RELAY --policy-file FILE
-tesera api --listen 127.0.0.1:4190 [--discover [relay:ID@]relay.tesera.net] [--advertise 127.0.0.1] [--udp-ports LOW-HIGH] [--prefer-joined] [--trust-proxy ADDR] [--log-level info]
-tesera recv --listen 0.0.0.0:4200 --sender HOST:4300 --discover [relay:ID@]relay.tesera.net --session SESSION --output FILE
-tesera send --listen 0.0.0.0:4300 --receiver HOST:4200 --discover [relay:ID@]relay.tesera.net --session SESSION --input FILE
-tesera stats --via relay.tesera.net [--json]
+type Command = { summary: string; usage: string; details: string }
+
+const policyEdit = (verb: string, effect: string): Command => ({
+  summary: `${effect} in a policy file`,
+  usage: `tesera ${verb} relay:ID --policy-file FILE`,
+  details: `${effect} in FILE. a relay started with the same --policy-file picks the change up while it runs`,
+})
+
+const COMMANDS: Record<string, Command> = {
+  session: {
+    summary: "print a new session secret",
+    usage: "tesera session",
+    details: "prints a new random session secret on stdout. share it with the other end through a channel you already trust",
+  },
+  id: {
+    summary: "make a relay identity",
+    usage: "tesera id [--out FILE]",
+    details: `makes a new relay identity and prints its relay id on stdout
+
+  --out FILE   write the secret to FILE, readable only by you. without it, the secret goes to stderr`,
+  },
+  relay: {
+    summary: "run a relay",
+    usage: "tesera relay --listen HOST:PORT [flags]",
+    details: `runs a relay that forwards tesserae over UDP
+
+  --listen HOST:PORT        where the relay listens, such as 0.0.0.0:4101
+  --allow-remote            forward for hosts other than this machine
+  --allow-dest CIDR         forward only to these destinations, repeatable
+  --identity FILE           the relay's identity secret, from tesera id. joins, records, and policy need it
+  --join [relay:ID@]HOST    join a seed and stay joined, needs --identity
+  --advertise HOST:PORT     the address peers send to, signed into the relay's record
+  --name TEXT               a name in the signed record
+  --record-file FILE        where the signed record is kept, next to the identity by default
+  --record-ttl SECONDS      how long a signed record is valid
+  --access private|open     who may join this relay, private by default. open needs --identity
+  --allow relay:ID          let this relay join, repeatable, needs --identity
+  --block relay:ID          refuse this relay, repeatable, needs --identity
+  --policy-file FILE        allow, block, and forget decisions kept across restarts, needs --identity
+  --peer-rate N             new peers a minute, 6 by default
+  --peers-file FILE         where joined peers are kept
+  --peer-ttl 30d            how long an offline peer is kept
+  --bandwidth 5mbps         forwarded megabits a second, data and control, 0 for no cap
+  --datagram-rate N         forwarded datagrams a second, 2000 by default
+  --max-sessions N          concurrent sessions, 8 by default
+  --api HOST:PORT           the relay's HTTP API, keep it on a private address
+  --metrics-file FILE       where forwarding totals are kept
+  --log-level info|debug|error
+  --webtransport HOST:PORT  accept attachments over WebTransport on this UDP port. needs --identity and Node.js 20.17 or newer
+  --webtransport-cert FILE  a certificate for --webtransport, with --webtransport-key. self-signed and rotated without them
+  --webtransport-key FILE`,
+  },
+  info: {
+    summary: "check a relay's signed record",
+    usage: "tesera info relay:ID@HOST:PORT [--json]",
+    details: "fetches the relay's record and checks its signature, id, freshness, reachability, and address. exits 1 if a check fails",
+  },
+  allow: policyEdit("allow", "let a relay join"),
+  block: policyEdit("block", "refuse a relay"),
+  unblock: policyEdit("unblock", "take a relay off the block list"),
+  forget: policyEdit("forget", "drop a relay from the peer list"),
+  api: {
+    summary: "run the control plane",
+    usage: "tesera api --listen HOST:PORT [flags]",
+    details: `runs the control plane: /v1/relays for discovery and /v1/rooms for the offer and answer
+
+  --listen HOST:PORT              where it listens, such as 127.0.0.1:4190
+  --discover [relay:ID@]HOST      the seed whose relays it lists, relay.tesera.net by default
+  --entries FILE                  attachment relays it lists, as {"entries":[{"relay","url","statement"}]}
+  --trust-proxy ADDR              read the client address from this proxy, repeatable
+  --log-level info|debug|error`,
+  },
+  send: {
+    summary: "send a file",
+    usage: "tesera send --listen HOST:PORT --receiver HOST:PORT --session SESSION --input FILE (--discover SEED | --relays LIST)",
+    details: `sends FILE to a receiver started with the same session
+
+  --discover [relay:ID@]HOST   find relays through this seed
+  --relays LIST                or use these relays, comma separated, as [relay:ID@]HOST:PORT
+  --k 2 --n 3                  any k of n tesserae rebuild a block`,
+  },
+  recv: {
+    summary: "receive a file",
+    usage: "tesera recv --listen HOST:PORT --sender HOST:PORT --session SESSION --output FILE (--discover SEED | --relays LIST)",
+    details: `receives into FILE from a sender started with the same session
+
+  --discover [relay:ID@]HOST   find relays through this seed
+  --relays LIST                or use these relays, comma separated, as [relay:ID@]HOST:PORT`,
+  },
+  stats: {
+    summary: "print a seed's network totals",
+    usage: "tesera stats --via HOST [--json]",
+    details: "asks a seed over UDP for its current view of the relays joined to it",
+  },
+}
+
+const HELP = `tesera COMMAND [flags]
+
+${Object.entries(COMMANDS)
+  .map(([name, command]) => `  ${name.padEnd(8)} ${command.summary}`)
+  .join("\n")}
+
+run tesera COMMAND --help for its flags
 `
+
+function commandHelp(name: string): string {
+  const command = COMMANDS[name]
+  if (!command) throw new Error(`unknown command ${name}. run tesera --help`)
+  return `${command.usage}\n\n${command.details}\n`
+}
 
 type Flags = Map<string, string | true>
 
@@ -87,6 +184,27 @@ function intFlag(flags: Flags, key: string, fallback: number): number {
   const parsed = numberFlag(flags, key, fallback)
   if (!Number.isInteger(parsed)) throw new Error(`--${key} must be an integer`)
   return parsed
+}
+
+/** Flags that no longer exist. Flags are otherwise not checked, so these would be ignored without a word. */
+const REMOVED: Record<string, Record<string, string>> = {
+  relay: {
+    browser: "--browser is now --webtransport",
+    "browser-cert": "--browser-cert is now --webtransport-cert",
+    "browser-key": "--browser-key is now --webtransport-key",
+  },
+  api: {
+    advertise: "--advertise was for the removed /v0 transfer API",
+    "udp-ports": "--udp-ports was for the removed /v0 transfer API",
+    "prefer-joined": "--prefer-joined was for the removed /v0 transfer API",
+  },
+}
+
+function refuseRemoved(command: string, argv: string[]): void {
+  for (const token of argv) {
+    const message = token.startsWith("--") ? REMOVED[command]?.[token.slice(2)] : undefined
+    if (message) throw new Error(message)
+  }
 }
 
 function flagOn(flags: Flags, key: string): boolean {
@@ -198,10 +316,19 @@ function adversityFromFlags(flags: Flags): Partial<Adversity> {
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2)
-  if (!command || command === "help" || command === "--help" || command === "-h") {
+  if (!command || command === "--help" || command === "-h") {
     console.log(HELP)
     return
   }
+  if (command === "help") {
+    console.log(rest[0] ? commandHelp(rest[0]) : HELP)
+    return
+  }
+  if (rest.includes("--help") || rest.includes("-h")) {
+    console.log(commandHelp(command))
+    return
+  }
+  refuseRemoved(command, rest)
   if (command === "allow" || command === "block" || command === "unblock" || command === "forget") {
     await editPolicy(command, rest)
     return
@@ -255,6 +382,14 @@ async function runRelay(argv: string[]): Promise<void> {
   if (access === "open" && !identity) {
     throw new Error("--access open needs --identity, because a relay without one cannot answer joins")
   }
+  if (flags.has("webtransport") && !identity) {
+    throw new Error("--webtransport needs --identity, because the relay signs what clients attach to with it")
+  }
+  for (const flag of ["allow", "block", "policy-file"]) {
+    if (flags.has(flag) && !identity) {
+      throw new Error(`--${flag} decides which relays may join, so it needs --identity, because a relay without one cannot answer joins`)
+    }
+  }
   const join = joinText ? splitRelayRef(joinText) : null
   const allowRemote = flagOn(flags, "allow-remote")
   if (join && !allowRemote && !isLoopbackName(join.host)) {
@@ -274,6 +409,9 @@ async function runRelay(argv: string[]): Promise<void> {
     allowed: repeated(argv, "allow").map(canonicalRelayId),
     blocked: repeated(argv, "block").map(canonicalRelayId),
   })
+  const webTransportText = optionalString(flags, "webtransport")
+  const webTransport = webTransportText ? await buildWebTransportListener(webTransportText, flags, logLevel) : null
+  const listener = webTransport?.listener ?? null
   const relay = new Relay({
     host: listen.host,
     port: listen.port,
@@ -294,10 +432,20 @@ async function runRelay(argv: string[]): Promise<void> {
     recordName,
     recordTtlSec: intFlag(flags, "record-ttl", DEFAULT_RECORD_TTL_SEC),
     recordFile: recordFileFor(identityValue, recordFileFlag),
+    localDelivery: listener?.localDelivery,
+    transportStatements: () => (webTransport?.listener.listening && identity ? [webTransport.statement(identity)] : []),
   })
   const endpoint = await relay.start()
   emit("info", logLevel, "relay", "listen", { addr: `${endpoint.host}:${endpoint.port}` })
   if (identity) emit("info", logLevel, "relay", "id", { id: identity.id })
+  if (webTransport) {
+    try {
+      await webTransport.start(relay)
+    } catch (err) {
+      await relay.close()
+      throw err
+    }
+  }
   if (joinText && join) {
     try {
       await relay.stayJoined({
@@ -306,6 +454,7 @@ async function runRelay(argv: string[]): Promise<void> {
         resolve: async () => (await resolveRelayRef(joinText)).endpoint,
       })
     } catch (err) {
+      if (webTransport) await webTransport.close()
       await relay.close()
       throw err
     }
@@ -317,6 +466,7 @@ async function runRelay(argv: string[]): Promise<void> {
     process.once("SIGINT", stop)
     process.once("SIGTERM", stop)
   })
+  if (webTransport) await webTransport.close()
   await relay.close()
   const stats = relay.stats
   emit("info", logLevel, "relay", "done", {
@@ -328,6 +478,51 @@ async function runRelay(argv: string[]): Promise<void> {
     limited: stats.droppedLimited,
     bytes: stats.forwardedBytes,
   })
+}
+
+/** A WebTransport attachment listener from the --webtransport flags, loaded only when they are given. */
+async function buildWebTransportListener(text: string, flags: Flags, logLevel: LogLevel) {
+  const value = text.startsWith(":") ? `0.0.0.0${text}` : text
+  const listen = parseListen(value)
+  const certFile = optionalString(flags, "webtransport-cert")
+  const keyFile = optionalString(flags, "webtransport-key")
+  if (Boolean(certFile) !== Boolean(keyFile)) {
+    throw new Error("--webtransport-cert and --webtransport-key go together, or omit both for a self-signed certificate")
+  }
+  const { WebTransportListener } = await import("./attach/listener.js")
+  const { loadCert, generateSelfSigned, pinnable } = await import("./attach/cert.js")
+  const { CertRotation } = await import("./attach/rotation.js")
+  const { signStatement } = await import("./attach/statement.js")
+  const { ATTACH_VERSION } = await import("./attach/framing.js")
+  // A relay's own self-signed certificates rotate. An operator's certificate is theirs to renew.
+  const rotation = certFile && keyFile ? null : new CertRotation(generateSelfSigned(), () => generateSelfSigned())
+  const cert = rotation ? rotation.active : loadCert(certFile!, keyFile!)
+  const listener = new WebTransportListener({ host: listen.host, port: listen.port, cert, log: (line) => console.log(line), logLevel })
+  await listener.load()
+  let timer: NodeJS.Timeout | null = null
+  return {
+    listener,
+    async start(relay: Relay) {
+      await listener.start(relay)
+      if (!rotation) return
+      timer = setInterval(() => {
+        const next = rotation.tick(listener.attachments.size === 0)
+        if (next) void listener.useCert(next).catch(() => emit("error", logLevel, "relay", "error", { reason: "webtransport-cert" }))
+      }, 10 * 60 * 1000)
+      timer.unref()
+    },
+    statement(identity: Identity) {
+      const certs = rotation ? rotation.published() : [listener.certificate].filter(pinnable)
+      return signStatement(identity, {
+        attach: ATTACH_VERSION,
+        certificates: certs.map((c) => ({ sha256: c.hash.toString("hex"), notAfter: Math.floor(c.notAfter / 1000) })),
+      })
+    },
+    async close() {
+      if (timer) clearInterval(timer)
+      await listener.close()
+    },
+  }
 }
 
 function isLoopbackName(host: string): boolean {
@@ -435,23 +630,21 @@ async function runApi(argv: string[]): Promise<void> {
   const flags = parseFlags(argv)
   const listen = parseListen(requiredString(flags, "listen"))
   const logLevel = parseLogLevel(optionalString(flags, "log-level") ?? "info")
-  const advertise = normalizeHost(optionalString(flags, "advertise") ?? "127.0.0.1")
-  const udpPorts = optionalString(flags, "udp-ports")
-  const ports = udpPorts ? parsePortRange(udpPorts) : null
-  if (flagOn(flags, "prefer-joined") && isLoopback(advertise)) {
-    throw new Error("--prefer-joined needs --advertise with an address joined relays can reach")
-  }
   const discover = await resolveRelayRef(optionalString(flags, "discover") ?? "relay.tesera.net")
+  const entriesFile = optionalString(flags, "entries")
+  const log = (event: string, fields: LogFields) => {
+    emit(event === "error" ? "error" : "info", logLevel, "api", event, fields)
+  }
+  const discovery = new Discovery({
+    entries: entriesFile ? await readEntries(resolve(entriesFile)) : [],
+    udpRelays: () => discoverRelays(discover.endpoint, { pinned: discover.id }),
+    log: (reason, fields) => log("error", { ...fields, reason }),
+  })
+  await discovery.start()
   const api = await listenPublicApi(listen.host, listen.port, {
-    discover: discover.endpoint,
-    discoverId: discover.id,
-    advertise,
-    ports,
-    preferJoined: flagOn(flags, "prefer-joined"),
     trustProxy: repeated(argv, "trust-proxy"),
-    log: (event, fields) => {
-      emit(event === "error" ? "error" : "info", logLevel, "api", event, fields)
-    },
+    discovery,
+    log,
   })
   await new Promise<void>((resolve) => {
     const stop = () => {
@@ -460,6 +653,7 @@ async function runApi(argv: string[]): Promise<void> {
     process.once("SIGINT", stop)
     process.once("SIGTERM", stop)
   })
+  discovery.stop()
   await api.close()
 }
 

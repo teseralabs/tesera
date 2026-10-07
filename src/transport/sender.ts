@@ -1,6 +1,5 @@
-import { randomBytes } from "node:crypto"
-import { type Socket } from "node:dgram"
-import { bindUdp, closeUdp, createUdpSocket, sendUdp, type Endpoint } from "../carrier/udp.js"
+import { randomBytes } from "../crypto/primitives.js"
+import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { encodeShards, splitCiphertext } from "../coding/reedsolomon.js"
 import {
   assertCode,
@@ -11,15 +10,19 @@ import {
   DEFAULT_SHARD,
   DEFAULT_TICK_MS,
   DEFAULT_WINDOW,
+  DATAGRAM_OVERHEAD,
   fullBlockBodySize,
   MAX_RETX_BACKOFF_MS,
   MIN_WINDOW,
+  shardForPacketSize,
 } from "../constants.js"
 import { assertSession, blockAad, deriveKeys, seal, sealedLength } from "../crypto/session.js"
 import { emptySenderStats, type SenderStats } from "../metrics.js"
 import { encodeEnvelope } from "../protocol/envelope.js"
 import { decodeFrame, encodeData } from "../protocol/frames.js"
 import { asError, Signal } from "../util.js"
+import { addressPerRelay, type PeerAddress } from "./address.js"
+import type { Probe } from "./probe.js"
 import { PathScheduler } from "./scheduler.js"
 
 /** How long arrivals may stop, on an unstretched retransmit timer, before a silent block is sent again. */
@@ -44,8 +47,13 @@ type BlockState = {
 
 export type SenderOptions = {
   session: Buffer
-  receiver: Endpoint
+  /** The receiver's address in each envelope: one for every relay, or one per relay in relay order. May be set later with `setReceiver`. */
+  receiver?: PeerAddress
   relays: Endpoint[]
+  /** The largest packet the receiver can accept, when it is known to be smaller than this sender's own transport. */
+  peerMaxPacketSize?: number
+  /** How packets travel. Omitted means a UDP socket on `bindHost:bindPort`. */
+  transport?: OpenTransport
   bindHost?: string
   bindPort?: number
   k?: number
@@ -59,6 +67,8 @@ export type SenderOptions = {
   /** Time allowed without a block acknowledgement while blocks are in flight. */
   idleMs?: number
   tickMs?: number
+  /** Timing notes for diagnostics. */
+  probe?: Probe
 }
 
 export class TeseraSender {
@@ -67,11 +77,16 @@ export class TeseraSender {
 
   private readonly aeadKey: Buffer
   private readonly macKey: Buffer
-  private readonly receiver: Endpoint
+  /** By relay index. Set from the receiver address when the sender starts. */
+  private receivers: Endpoint[] = []
+  private receiverAddr: PeerAddress | null
+  private peerMaxPacketSize: number
   private readonly relays: Endpoint[]
   private readonly k: number
   private readonly n: number
-  private readonly bodySize: number
+  private readonly requestedShard: number
+  private shardSize = 0
+  private bodySize = 0
   private readonly window: number
   private readonly maxSends: number
   private readonly retxAfterMs: number
@@ -79,10 +94,10 @@ export class TeseraSender {
   private readonly idleMs: number
   private readonly maxBackoffMs: number
   private readonly tickMs: number
-  private readonly bindHost: string
-  private readonly bindPort: number
-  private readonly sessionId = randomBytes(16)
+  private readonly openTransport: OpenTransport
+  private readonly id = randomBytes(16)
   private readonly scheduler: PathScheduler
+  private readonly probe: Probe | null
   private readonly inflight = new Map<number, BlockState>()
   private readonly awaitingSample = new Map<
     string,
@@ -92,7 +107,7 @@ export class TeseraSender {
   private readonly lossWatch = new Map<string, number>()
   private readonly wake = new Signal()
 
-  private socket: Socket | null = null
+  private transport: PacketTransport | null = null
   private bound: Endpoint | null = null
   private pending: Uint8Array = Buffer.alloc(0)
   private nextBlockId = 0
@@ -100,7 +115,7 @@ export class TeseraSender {
   private stopped = false
   private closed = false
   private error: Error | null = null
-  private timer: NodeJS.Timeout | null = null
+  private timer: ReturnType<typeof setTimeout> | null = null
   private deadlineAt = 0
   /** Set once a block ACK arrives, so a missing path sample cannot hold the window at one. */
   private opened = false
@@ -115,18 +130,19 @@ export class TeseraSender {
 
   constructor(opts: SenderOptions) {
     assertSession(opts.session)
-    const keys = deriveKeys(opts.session, this.sessionId)
+    const keys = deriveKeys(opts.session, this.id)
     this.aeadKey = keys.aeadKey
     this.macKey = keys.macKey
     if (opts.relays.length < 1) throw new Error("sender needs at least one relay")
     this.relays = opts.relays
-    this.receiver = opts.receiver
+    this.receiverAddr = opts.receiver ?? null
+    if (this.receiverAddr) addressPerRelay(this.receiverAddr, this.relays)
+    this.peerMaxPacketSize = opts.peerMaxPacketSize ?? Infinity
     this.k = opts.k ?? 2
     this.n = opts.n ?? 3
     assertCode(this.k, this.n)
-    const shardSize = opts.shardSize ?? DEFAULT_SHARD
-    assertShardSize(shardSize)
-    this.bodySize = fullBlockBodySize(this.k, shardSize)
+    this.requestedShard = opts.shardSize ?? DEFAULT_SHARD
+    assertShardSize(this.requestedShard)
     this.window = opts.window ?? DEFAULT_WINDOW
     if (!Number.isInteger(this.window) || this.window < 1) throw new Error("window must be >= 1")
     this.maxSends = opts.maxSends ?? DEFAULT_MAX_SENDS
@@ -137,9 +153,9 @@ export class TeseraSender {
     this.maxBackoffMs = Math.max(MAX_RETX_BACKOFF_MS, this.retxAfterMs)
     this.congestion = this.window
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
-    this.bindHost = opts.bindHost ?? "127.0.0.1"
-    this.bindPort = opts.bindPort ?? 0
+    this.openTransport = transportOrUdp(opts)
     this.scheduler = new PathScheduler(this.relays.length, this.k, this.n)
+    this.probe = opts.probe ?? null
   }
 
   get endpoint(): Endpoint {
@@ -147,14 +163,40 @@ export class TeseraSender {
     return this.bound
   }
 
+  /** The random id in every frame of this transfer. Known before start, so it can be shared ahead of the first packet. */
+  get sessionId(): Buffer {
+    return Buffer.from(this.id)
+  }
+
+  /** The size of a full data datagram, known after start. A caller can check it fits its transport. */
+  get datagramSize(): number {
+    if (!this.transport) throw new Error("sender has not started")
+    return this.shardSize + DATAGRAM_OVERHEAD
+  }
+
+  /** Set or replace the receiver's address, and optionally the largest packet it can accept. Must be called before `start`. */
+  setReceiver(receiver: PeerAddress, peerMaxPacketSize?: number): void {
+    if (this.transport) throw new Error("sender already started")
+    addressPerRelay(receiver, this.relays)
+    this.receiverAddr = receiver
+    if (peerMaxPacketSize !== undefined) this.peerMaxPacketSize = peerMaxPacketSize
+  }
+
   async start(): Promise<Endpoint> {
-    const socket = createUdpSocket()
-    this.socket = socket
-    this.bound = await bindUdp(socket, this.bindHost, this.bindPort)
-    socket.on("message", (msg) => {
-      void this.onMessage(Buffer.from(msg)).catch((err) => this.fail(err))
+    if (!this.receiverAddr) throw new Error("sender needs a receiver address")
+    this.receivers = addressPerRelay(this.receiverAddr, this.relays)
+    const transport = await this.openTransport({
+      packet: (packet) => {
+        void this.onMessage(Buffer.from(packet)).catch((err) => this.fail(err))
+      },
+      error: (err) => this.fail(err),
     })
-    socket.on("error", (err) => this.fail(err))
+    this.transport = transport
+    this.bound = transport.endpoint
+    // Fit the shard to whichever is smaller: this transport, or the packet the receiver can accept.
+    const limit = Math.min(transport.maxPacketSize, this.peerMaxPacketSize)
+    this.shardSize = Math.min(this.requestedShard, shardForPacketSize(limit))
+    this.bodySize = fullBlockBodySize(this.k, this.shardSize)
     this.arm()
     return this.bound
   }
@@ -215,14 +257,17 @@ export class TeseraSender {
       this.error = new Error("sender closed before completion")
     }
     this.wake.notify()
-    const socket = this.socket
-    this.socket = null
-    if (socket) await closeUdp(socket).catch(() => {})
+    const transport = this.transport
+    this.transport = null
+    if (transport) await transport.close().catch(() => {})
   }
 
   private async sendBody(body: Uint8Array, fin: boolean): Promise<void> {
     const owned = Uint8Array.from(body)
+    const probe = this.probe
+    const waitFrom = probe ? performance.now() : 0
     await this.waitForSlot()
+    if (probe) probe.note("sender.slot-wait", performance.now() - waitFrom)
     if (this.error) throw this.error
     if (this.deadlineAt === 0) this.deadlineAt = Date.now() + this.deadlineMs
     const blockId = this.nextBlockId++
@@ -236,7 +281,7 @@ export class TeseraSender {
       owned,
       Date.now(),
       blockAad({
-        sessionId: this.sessionId,
+        sessionId: this.id,
         blockId,
         k: this.k,
         n: this.n,
@@ -249,10 +294,15 @@ export class TeseraSender {
     const t1 = performance.now()
     const shards = encodeShards(splitCiphertext(cipher, this.k), this.k, this.n)
     this.stats.encodeMs += performance.now() - t1
+    if (probe) {
+      probe.note("sender.seal", t1 - t0)
+      probe.note("sender.encode", performance.now() - t1)
+    }
+    const t2 = probe ? performance.now() : 0
     const frames = shards.map((shard, index) =>
       encodeData({
         kind: "data",
-        sessionId: this.sessionId,
+        sessionId: this.id,
         blockId,
         tesseraIndex: index,
         k: this.k,
@@ -262,6 +312,13 @@ export class TeseraSender {
       }),
     )
     const plan = this.scheduler.plan()
+    if (probe) {
+      probe.note("sender.frame", performance.now() - t2)
+      probe.note("sender.tesserae-planned", plan.filter((relay) => relay !== null).length)
+      probe.note("sender.inflight", this.inflight.size)
+      probe.note("sender.open-window", this.openWindow())
+      probe.step(blockId, "open", t0)
+    }
     const block: BlockState = {
       id: blockId,
       frames,
@@ -280,6 +337,7 @@ export class TeseraSender {
       if (relay === null || relay === undefined) continue
       await this.transmit(block, index, relay, false)
     }
+    if (probe) probe.step(blockId, "sent", performance.now())
   }
 
   private async waitForSlot(): Promise<void> {
@@ -300,9 +358,12 @@ export class TeseraSender {
 
   private async onMessage(msg: Buffer): Promise<void> {
     if (this.closed) return
+    const probe = this.probe
+    const t0 = probe ? performance.now() : 0
     const frame = decodeFrame(msg, this.macKey)
+    if (probe) probe.note("sender.control-decode", performance.now() - t0)
     if (!frame || frame.kind === "data") return
-    if (!frame.sessionId.equals(this.sessionId)) return
+    if (!frame.sessionId.equals(this.id)) return
     if (frame.kind === "sample") {
       this.markProgress()
       this.noteSample(frame.blockId, frame.tesseraIndex)
@@ -311,12 +372,15 @@ export class TeseraSender {
     const block = this.inflight.get(frame.blockId)
     if (!block) return
     if (frame.kind === "ack") {
+      if (probe) probe.step(frame.blockId, "acked", t0)
       this.markProgress()
       this.settleQuiet(block)
       block.acked = true
       this.opened = true
       this.lastAckAt = Date.now()
       this.congestion = Math.min(this.window, this.congestion + 1 / this.congestion)
+      this.stats.windowSum += this.openWindow()
+      this.stats.windowCount++
       this.inflight.delete(frame.blockId)
       this.wake.notify()
       return
@@ -327,6 +391,7 @@ export class TeseraSender {
     const wanted = [...new Set(frame.missing)].filter((index) => index >= 0 && index < block.frames.length)
     const ripe = wanted.filter((index) => !this.placementHeld(block, index, performance.now()))
     if (ripe.length === 0) return
+    probe?.note("sender.retx-nack", ripe.length)
     await this.retransmit(block, ripe)
   }
 
@@ -352,6 +417,7 @@ export class TeseraSender {
       if (this.heldInQueue(block, perfNow)) continue
       const indices = this.repairIndices(block)
       if (indices.length === 0) continue
+      this.probe?.note(due ? "sender.retx-timer" : "sender.retx-stall", indices.length)
       await this.retransmit(block, indices)
     }
   }
@@ -427,11 +493,12 @@ export class TeseraSender {
     relayIndex: number,
     retransmission: boolean,
   ): Promise<void> {
-    const socket = this.socket
+    const transport = this.transport
     const frame = block.frames[index]
-    if (!socket || !frame || block.acked || this.stopped) return
+    if (!transport || !frame || block.acked || this.stopped) return
     const relay = this.relays[relayIndex]
-    if (!relay) throw new Error("missing relay")
+    const receiver = this.receivers[relayIndex]
+    if (!relay || !receiver) throw new Error("missing relay")
     const sentAt = performance.now()
     if (this.lastProgressAt === 0) this.lastProgressAt = sentAt
     block.placements[index] = { relay: relayIndex, sentAt, settled: false }
@@ -443,12 +510,13 @@ export class TeseraSender {
       cohort,
       lossToken: 0,
     })
-    const packet = encodeEnvelope(this.receiver, frame)
+    const packet = encodeEnvelope(receiver, frame)
     this.stats.dataWireBytes += packet.length
     this.stats.tesseraSends++
     if (retransmission) this.stats.tesseraRetransmissions++
     try {
-      await sendUdp(socket, packet, relay)
+      await transport.send(packet, relay)
+      if (this.probe) this.probe.note("sender.send", performance.now() - sentAt)
     } catch (err) {
       this.fail(err)
       throw this.error ?? asError(err)
@@ -470,6 +538,7 @@ export class TeseraSender {
     this.recoverFrom = this.nextBlockId
     const floor = Math.min(this.window, MIN_WINDOW)
     this.congestion = Math.max(floor, this.congestion / 2)
+    this.probe?.note("sender.window-cut", this.congestion)
   }
 
   private sampleKey(blockId: number, index: number): string {
@@ -483,6 +552,9 @@ export class TeseraSender {
     if (!pending) return
     this.awaitingSample.delete(key)
     const rtt = performance.now() - pending.sentAt
+    this.probe?.note("sender.sample-rtt", rtt)
+    this.stats.sampleRttSumMs += rtt
+    this.stats.sampleRttCount++
     if (pending.inflight) this.scheduler.observe(pending.relay, rtt, pending.cohort)
     else this.scheduler.noteRtt(pending.relay, rtt, pending.cohort, pending.lossToken)
     const place = this.inflight.get(blockId)?.placements[index]

@@ -31,7 +31,7 @@ export const RECORD_DOMAIN = Buffer.from("tesera-relay-record-v1\0")
 /** This build's self-reported name. A signature does not prove the binary is unmodified. */
 export const IMPLEMENTATION_ID = "tesera"
 /** Keep this in step with package.json. It is a claim, not a measurement. */
-export const SOFTWARE_VERSION = "0.2.1-beta"
+export const SOFTWARE_VERSION = "0.3.0-beta"
 /** Informational. Unknown tokens are ignored, and none of these relax a check. */
 export const RECORD_CAPABILITIES = ["discover", "forward"] as const
 
