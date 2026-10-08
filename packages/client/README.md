@@ -27,7 +27,7 @@ npm install /path/to/tesera/packages/client/tesera-client-0.1.0-beta.tgz
 
 it depends on `@noble/ciphers`, `@noble/hashes`, and `buffer`, and has no native code. its types are web types, so a browser project doesn't need `@types/node`
 
-a site with no build step can bundle it once into one module, as tesera.net does with esbuild
+a site with no build step can bundle it once into one module, with esbuild or a similar tool
 
 ## send
 
@@ -72,7 +72,7 @@ a control plane is `tesera api`. `/v1/relays` lists relays, and `/v1/rooms` hold
 - `share.expiresAt` is when the room ends. the first answer wins
 - a receiver that wants a different attachment relay from the sender's passes `avoidSenderEntry: true`
 
-tesera labs runs one at `https://api.tesera.net` for tesera.net. it's a beta service with no availability guarantee
+tesera.net runs one at `https://api.tesera.net`, as a beta service with no availability promise
 
 `ControlPlane` is an interface, so an application can carry the offer and the answer another way and still use `shareTransfer` and `joinTransfer`
 
@@ -138,13 +138,7 @@ the other end isn't told. it stops when its timers run out
 
 ## relays and coded paths
 
-a transfer is cut into blocks. each block is encrypted, then coded into 3 tesserae, and any 2 rebuild it. each tessera takes a different UDP relay, a coded path, so a transfer can lose one of its 3 paths
-
-```text
-page ── WebTransport ── attachment relay ──┬── relay ──┐
-                                           ├── relay ──┼── attachment relay ── WebTransport ── page
-                                           └── relay ──┘
-```
+by default, each block becomes 3 tesserae, each sent through a different UDP relay. the receiver only needs 2 to reconstruct the block. [how it works](../../README.md#how-it-works) has the picture
 
 a browser can't send UDP, so each end attaches to an attachment relay, a tesera relay started with `--webtransport`. if it goes away, that end's transfer stops. both ends may use the same one
 
@@ -158,12 +152,9 @@ nothing measures relays or knows who runs them, so 3 paths may share an operator
 
 `webTransport` and `discoveryTransport` are the transports this package ships. `ClientTransport` is an interface, if you need another. `webTransportSupported()` says whether the page can use WebTransport
 
-- Chrome: tested with Chrome 154. other Chromium browsers aren't tested
-- Firefox: tested with Firefox 130
-- Safari: not tested
-- Node.js: 20 or newer, with a WebTransport implementation passed as `WebTransport`, such as `@fails-components/webtransport` 1.6.8, which needs Node.js 20.17 or newer
+browser transfers work in chrome and firefox, and in safari with a compatible attachment relay. a page has to be served over HTTPS, or from `localhost`
 
-a page has to be served over HTTPS, or from `localhost`
+Node.js 20 or newer needs a WebTransport implementation passed as `WebTransport`, such as `@fails-components/webtransport` 1.6.8, which needs Node.js 20.17 or newer
 
 `certificateHash` pins an attachment relay's certificate by its SHA-256, in hex, and takes one hash or a list. browsers pin only certificates valid for 14 days or less, so relays rotate them. discovery lists the next hash before the switch. without a control plane you need the current hash yourself. a relay with a certificate from a public authority needs no hash
 
@@ -185,7 +176,7 @@ every failure is a `TeseraError` with a `code`
 
 ## security and metadata
 
-the secret is made on the sending device. the keys come from it at each end. relays, the control plane, and the page server never get the secret or a key from it, and see file data only as ciphertext
+the secret is made on the sending device, and the keys come from it at each end. relays, the control plane, and the page server never get it, and see file data only as ciphertext
 
 anyone who has the secret can read the transfer, so share it through a channel you already trust
 
@@ -195,12 +186,7 @@ room answers aren't authenticated yet. someone who learns a room id could answer
 
 a page's code comes from the site that serves it, so its users trust that site
 
-tesera doesn't hide who is talking to whom, and doesn't claim anonymity
-
-- a relay sees the addresses it exchanges packets with, timing, sizes, and the session id
-- an attachment relay also sees its browser's IP address
-- a control plane sees each end's IP address and user agent, timing, the room, the offer, and the answer: the session id, the attachment addresses, the coded paths, the coding, the size, and the packet limit
-- a page server sees ordinary requests, without a link's fragment
+tesera doesn't claim anonymity. relays see addresses, timing, and sizes, and a control plane also sees the offer and the answer
 
 ## running your own
 
@@ -223,13 +209,13 @@ a control plane lists it from an entries file, and lists the UDP relays its seed
 npm run tesera -- api --listen 127.0.0.1:4190 --discover relay:ID@203.0.113.10:4101 --entries entries.json
 ```
 
-put HTTPS in front of it for pages. [tesera.net/docs](https://tesera.net/docs#relay-attach) covers relays and the control plane
+put HTTPS in front of it for pages. [attachment relays](https://tesera.net/docs#attach) and [api](https://tesera.net/docs#api) cover both in more detail
+
+the published WebTransport binaries don't support safari yet. safari requires an attachment relay with a compatible WebTransport implementation
 
 ## versions
 
-this package has its own version, in [CHANGELOG.md](CHANGELOG.md). it speaks tesera protocol 2, the same as the CLI and relays, and is built from the same source
-
-the control plane's `/v1`, a relay's `/v1`, the wire, and the attach version all change separately
+this package has its own version, in [CHANGELOG.md](CHANGELOG.md). it speaks tesera wire version 2, the same as the CLI and relays
 
 ## development
 
