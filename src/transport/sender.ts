@@ -12,6 +12,8 @@ import {
   DEFAULT_WINDOW,
   DATAGRAM_OVERHEAD,
   fullBlockBodySize,
+  INITIAL_WINDOW,
+  LEGACY_AHEAD,
   MAX_RETX_BACKOFF_MS,
   MIN_WINDOW,
   shardForPacketSize,
@@ -27,6 +29,10 @@ import { PathScheduler } from "./scheduler.js"
 
 /** How long arrivals may stop, on an unstretched retransmit timer, before a silent block is sent again. */
 const SAMPLE_STALL_MS = 40
+/** CUBIC's window after a loss, as a share of the window before it. */
+const CUBIC_BETA = 0.7
+/** CUBIC's growth constant, in blocks per second cubed. */
+const CUBIC_C = 0.4
 
 type Placement = {
   relay: number
@@ -42,7 +48,20 @@ type BlockState = {
   nextRetxAt: number
   /** Wait before the next timed resend. Doubles after each resend. */
   backoffMs: number
+  /** performance.now() of the last resend, 0 before one. */
+  resentAt: number
   acked: boolean
+}
+
+/** The congestion state from before a cut, kept until the cut proves real or spurious. */
+type Undo = {
+  blockId: number
+  congestion: number
+  slowStartUntil: number
+  lossWindow: number
+  growthFrom: number
+  growthPeakSec: number
+  recoverFrom: number
 }
 
 export type SenderOptions = {
@@ -52,6 +71,8 @@ export type SenderOptions = {
   relays: Endpoint[]
   /** The largest packet the receiver can accept, when it is known to be smaller than this sender's own transport. */
   peerMaxPacketSize?: number
+  /** How far past its next block to deliver the receiver accepts blocks. Defaults to what every release accepts. */
+  peerAhead?: number
   /** How packets travel. Omitted means a UDP socket on `bindHost:bindPort`. */
   transport?: OpenTransport
   bindHost?: string
@@ -81,6 +102,7 @@ export class TeseraSender {
   private receivers: Endpoint[] = []
   private receiverAddr: PeerAddress | null
   private peerMaxPacketSize: number
+  private peerAhead: number
   private readonly relays: Endpoint[]
   private readonly k: number
   private readonly n: number
@@ -121,8 +143,23 @@ export class TeseraSender {
   private opened = false
   /** performance.now() of the last send or reply. The first send starts the stall clock. */
   private lastProgressAt = 0
-  /** Blocks allowed in flight. Loss halves it once per window, each window of ACKs adds one. */
+  /**
+   * Blocks allowed in flight. Slow start adds one per ACK until the first loss. After that, CUBIC:
+   * each loss cuts it to CUBIC_BETA of itself, once per window, and it grows back toward the
+   * window before the loss along a cubic curve in time, so a long path recovers in seconds.
+   */
   private congestion = 0
+  private slowStartUntil = Infinity
+  /** The window before the last loss, and when CUBIC's growth from that loss started. */
+  private lossWindow = 0
+  private growthFrom = 0
+  private growthPeakSec = 0
+  private smoothedRttMs = 0
+  private rttVarMs = 0
+  private minRttMs = Infinity
+  /** performance.now() send time of the newest tessera that has been answered. */
+  private newestAnsweredAt = 0
+  private undo: Undo | null = null
   /** Loss on a block below this id was already answered by the last cut. */
   private recoverFrom = 0
   /** Date.now() of the last block ACK, or of the send that started a busy period. */
@@ -138,6 +175,8 @@ export class TeseraSender {
     this.receiverAddr = opts.receiver ?? null
     if (this.receiverAddr) addressPerRelay(this.receiverAddr, this.relays)
     this.peerMaxPacketSize = opts.peerMaxPacketSize ?? Infinity
+    this.peerAhead = opts.peerAhead ?? LEGACY_AHEAD
+    if (!Number.isInteger(this.peerAhead) || this.peerAhead < 1) throw new Error("peerAhead must be >= 1")
     this.k = opts.k ?? 2
     this.n = opts.n ?? 3
     assertCode(this.k, this.n)
@@ -151,7 +190,7 @@ export class TeseraSender {
     this.idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
     if (!(this.idleMs > 0)) throw new Error("idle timeout must be > 0")
     this.maxBackoffMs = Math.max(MAX_RETX_BACKOFF_MS, this.retxAfterMs)
-    this.congestion = this.window
+    this.congestion = Math.min(this.window, INITIAL_WINDOW)
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
     this.openTransport = transportOrUdp(opts)
     this.scheduler = new PathScheduler(this.relays.length, this.k, this.n)
@@ -174,12 +213,19 @@ export class TeseraSender {
     return this.shardSize + DATAGRAM_OVERHEAD
   }
 
-  /** Set or replace the receiver's address, and optionally the largest packet it can accept. Must be called before `start`. */
-  setReceiver(receiver: PeerAddress, peerMaxPacketSize?: number): void {
+  /**
+   * Set or replace the receiver's address, and optionally the largest packet it can accept and how
+   * far ahead it accepts blocks. Must be called before `start`.
+   */
+  setReceiver(receiver: PeerAddress, peerMaxPacketSize?: number, peerAhead?: number): void {
     if (this.transport) throw new Error("sender already started")
     addressPerRelay(receiver, this.relays)
     this.receiverAddr = receiver
     if (peerMaxPacketSize !== undefined) this.peerMaxPacketSize = peerMaxPacketSize
+    if (peerAhead !== undefined) {
+      if (!Number.isInteger(peerAhead) || peerAhead < 1) throw new Error("peerAhead must be >= 1")
+      this.peerAhead = peerAhead
+    }
   }
 
   async start(): Promise<Endpoint> {
@@ -327,6 +373,7 @@ export class TeseraSender {
       sends: 1,
       nextRetxAt: Date.now() + firstWait,
       backoffMs: firstWait,
+      resentAt: 0,
       acked: false,
     }
     if (this.inflight.size === 0) this.lastAckAt = Date.now()
@@ -342,7 +389,7 @@ export class TeseraSender {
   }
 
   private async waitForSlot(): Promise<void> {
-    while (this.inflight.size >= this.openWindow() && !this.error && !this.stopped) {
+    while ((this.inflight.size >= this.openWindow() || this.pastPeerAhead()) && !this.error && !this.stopped) {
       await this.wake.wait()
     }
     if (this.error) throw this.error
@@ -375,11 +422,13 @@ export class TeseraSender {
     if (frame.kind === "ack") {
       if (probe) probe.step(frame.blockId, "acked", t0)
       this.markProgress()
+      this.noteAnswered(block)
       this.settleQuiet(block)
       block.acked = true
       this.opened = true
       this.lastAckAt = Date.now()
-      this.congestion = Math.min(this.window, this.congestion + 1 / this.congestion)
+      this.undoSpuriousCut(block)
+      this.grow()
       this.stats.windowSum += this.openWindow()
       this.stats.windowCount++
       this.inflight.delete(frame.blockId)
@@ -415,7 +464,7 @@ export class TeseraSender {
       if (block.acked) continue
       const due = now >= block.nextRetxAt
       if (!due && !(stalled && block.sends === 1 && this.unansweredFor(block, perfNow))) continue
-      if (this.heldInQueue(block, perfNow)) continue
+      if (this.heldInQueue(block, perfNow) || !this.lossEvident(block, perfNow)) continue
       const indices = this.repairIndices(block)
       if (indices.length === 0) continue
       this.probe?.note(due ? "sender.retx-timer" : "sender.retx-stall", indices.length)
@@ -435,10 +484,27 @@ export class TeseraSender {
     return false
   }
 
+  /**
+   * A block counts as lost once something sent after it has been answered. While nothing is answered
+   * at all, the path is stalled rather than losing this block, and a full timeout from the last
+   * reply passes before anything is resent, so a delay spike doesn't resend the whole window.
+   */
+  private lossEvident(block: BlockState, now: number): boolean {
+    let lastSent = 0
+    for (const place of block.placements) if (place && place.sentAt > lastSent) lastSent = place.sentAt
+    return this.newestAnsweredAt > lastSent || now - this.lastProgressAt >= this.timeoutMs()
+  }
+
+  private noteAnswered(block: BlockState): void {
+    for (const place of block.placements) {
+      if (place && place.sentAt > this.newestAnsweredAt) this.newestAnsweredAt = place.sentAt
+    }
+  }
+
   private placementHeld(block: BlockState, index: number, now: number): boolean {
     const place = block.placements[index]
     if (!place || place.settled) return false
-    const hold = Math.min(this.retxAfterMs * 4, this.scheduler.repairHoldMs(place.relay))
+    const hold = Math.max(Math.min(this.retxAfterMs * 4, this.scheduler.repairHoldMs(place.relay)), this.timeoutMs())
     return hold > 0 && now - place.sentAt < hold
   }
 
@@ -472,6 +538,7 @@ export class TeseraSender {
       return
     }
     block.sends++
+    block.resentAt = performance.now()
     block.backoffMs = Math.min(this.maxBackoffMs, block.backoffMs * 2)
     block.nextRetxAt = Date.now() + block.backoffMs
     this.noteLoss(block.id)
@@ -533,11 +600,37 @@ export class TeseraSender {
     for (const relay of plan) {
       if (relay !== null) slowest = Math.max(slowest, this.scheduler.rttMs(relay))
     }
-    return Math.min(this.maxBackoffMs, Math.max(this.retxAfterMs, slowest * 2))
+    return Math.min(this.maxBackoffMs, Math.max(this.retxAfterMs, slowest * 2, this.timeoutMs()))
+  }
+
+  /** RFC 6298's retransmission timeout from every sample: a queue that grows or swings stretches it. 0 before a sample. */
+  private timeoutMs(): number {
+    return this.smoothedRttMs === 0 ? 0 : this.smoothedRttMs + 4 * this.rttVarMs
   }
 
   private openWindow(): number {
     return this.opened ? Math.max(1, Math.floor(this.congestion)) : 1
+  }
+
+  /** The next block would land past what the receiver accepts while the oldest unacknowledged one is missing. */
+  private pastPeerAhead(): boolean {
+    const oldest = this.inflight.keys().next()
+    return !oldest.done && this.nextBlockId >= oldest.value + this.peerAhead
+  }
+
+  private grow(): void {
+    if (this.congestion < this.slowStartUntil) {
+      this.congestion = Math.min(this.window, this.congestion + 1)
+      return
+    }
+    const t = (performance.now() - this.growthFrom) / 1000
+    const cubic = CUBIC_C * (t - this.growthPeakSec) ** 3 + this.lossWindow
+    // Never slower than Reno would grow from the same loss, so short paths keep up with TCP.
+    const rttSec = Math.max(0.001, (this.smoothedRttMs || DEFAULT_RETX_AFTER_MS) / 1000)
+    const reno = this.lossWindow * CUBIC_BETA + ((3 * (1 - CUBIC_BETA)) / (1 + CUBIC_BETA)) * (t / rttSec)
+    const target = Math.min(this.congestion * 1.5, Math.max(cubic, reno))
+    const step = target > this.congestion ? (target - this.congestion) / this.congestion : 0.01 / this.congestion
+    this.congestion = Math.min(this.window, this.congestion + step)
   }
 
   /**
@@ -547,11 +640,47 @@ export class TeseraSender {
    * loss cannot starve the transfer.
    */
   private noteLoss(blockId: number): void {
+    // Before any round trip is measured, a resend is a guess about the path, not a sign of a full queue.
+    if (!this.scheduler.hasObservation) return
     if (blockId < this.recoverFrom) return
+    const recoverFrom = this.recoverFrom
     this.recoverFrom = this.nextBlockId
     const floor = Math.min(this.window, MIN_WINDOW)
-    this.congestion = Math.max(floor, this.congestion / 2)
+    this.undo = {
+      blockId,
+      congestion: this.congestion,
+      slowStartUntil: this.slowStartUntil,
+      lossWindow: this.lossWindow,
+      growthFrom: this.growthFrom,
+      growthPeakSec: this.growthPeakSec,
+      recoverFrom,
+    }
+    // A loss before the window regained its last peak means less room now, so aim lower.
+    this.lossWindow = this.congestion < this.lossWindow ? (this.congestion * (1 + CUBIC_BETA)) / 2 : this.congestion
+    this.congestion = Math.max(floor, this.congestion * CUBIC_BETA)
+    this.slowStartUntil = this.congestion
+    this.growthFrom = performance.now()
+    this.growthPeakSec = Math.cbrt((this.lossWindow * (1 - CUBIC_BETA)) / CUBIC_C)
+    this.stats.windowCuts++
     this.probe?.note("sender.window-cut", this.congestion)
+  }
+
+  /**
+   * The block whose resend cut the window was acknowledged sooner than the resend could have made a
+   * round trip, so the original got through and the cut answered a late reply, not a full queue.
+   */
+  private undoSpuriousCut(block: BlockState): void {
+    const undo = this.undo
+    if (!undo || undo.blockId !== block.id || block.resentAt === 0) return
+    this.undo = null
+    if (performance.now() - block.resentAt >= this.minRttMs / 2) return
+    this.congestion = undo.congestion
+    this.slowStartUntil = undo.slowStartUntil
+    this.lossWindow = undo.lossWindow
+    this.growthFrom = undo.growthFrom
+    this.growthPeakSec = undo.growthPeakSec
+    this.recoverFrom = undo.recoverFrom
+    this.stats.windowCutsUndone++
   }
 
   private sampleKey(blockId: number, index: number): string {
@@ -565,8 +694,17 @@ export class TeseraSender {
     if (!pending) return
     this.awaitingSample.delete(key)
     const rtt = performance.now() - pending.sentAt
+    if (pending.sentAt > this.newestAnsweredAt) this.newestAnsweredAt = pending.sentAt
     this.probe?.note("sender.sample-rtt", rtt)
     this.stats.sampleRttSumMs += rtt
+    if (rtt < this.minRttMs) this.minRttMs = rtt
+    if (this.smoothedRttMs === 0) {
+      this.smoothedRttMs = rtt
+      this.rttVarMs = rtt / 2
+    } else {
+      this.rttVarMs = this.rttVarMs * 0.75 + Math.abs(this.smoothedRttMs - rtt) * 0.25
+      this.smoothedRttMs = this.smoothedRttMs * 0.875 + rtt * 0.125
+    }
     this.stats.sampleRttCount++
     if (pending.inflight) this.scheduler.observe(pending.relay, rtt, pending.cohort)
     else this.scheduler.noteRtt(pending.relay, rtt, pending.cohort, pending.lossToken)

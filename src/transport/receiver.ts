@@ -82,7 +82,7 @@ export class TeseraReceiver {
   private unreadBytes = 0
   private readonly maxUnreadBytes: number
   /** Blocks held unacknowledged until `read` brings the unread bytes back under the limit. */
-  private readonly heldAcks = new Set<number>()
+  private readonly heldAcks = new Map<number, number>()
   private readonly readWake = new Signal()
 
   private transport: PacketTransport | null = null
@@ -94,6 +94,7 @@ export class TeseraReceiver {
   private n = 0
   private nextDeliver = 0
   private highestSeen = -1
+  private gapsFrom = 0
   private streamEnded = false
   private stopped = false
   private closed = false
@@ -119,6 +120,11 @@ export class TeseraReceiver {
   get endpoint(): Endpoint {
     if (!this.bound) throw new Error("receiver has not started")
     return this.bound
+  }
+
+  /** How far past the next block to deliver this receiver accepts blocks. A sender must stay inside it. */
+  get ahead(): number {
+    return this.maxAhead
   }
 
   setSender(sender: PeerAddress): void {
@@ -201,7 +207,8 @@ export class TeseraReceiver {
   private async onMessage(msg: Buffer, remote: Endpoint): Promise<void> {
     if (this.closed || this.error) return
     // A data frame has no MAC and the first one picks the session id, so only relays may deliver.
-    if (this.relayIndex(remote) < 0) return
+    const via = this.relayIndex(remote)
+    if (via < 0) return
     const probe = this.probe
     const t0 = probe ? performance.now() : 0
     const frame = decodeFrame(msg, this.macKey)
@@ -210,22 +217,22 @@ export class TeseraReceiver {
     if (this.sessionId && !this.sessionId.equals(frame.sessionId)) return
     if (frame.blockId < this.nextDeliver) {
       probe?.note("receiver.late-tessera", 1)
-      if (this.ackable.has(frame.blockId)) await this.ackOrHold(frame.blockId)
+      if (this.ackable.has(frame.blockId)) await this.ackOrHold(frame.blockId, via)
       return
     }
     if (frame.blockId > this.nextDeliver + this.maxAhead) return
     if (!this.adopt(frame.sessionId)) return
     if (this.done.has(frame.blockId)) {
       probe?.note("receiver.late-tessera", 1)
-      await this.ackOrHold(frame.blockId)
+      await this.ackOrHold(frame.blockId, via)
       return
     }
     const first = this.noteArrival(frame.blockId, frame.tesseraIndex)
     if (first) void this.sendSample(frame.blockId, frame.tesseraIndex, remote).catch(() => {})
-    this.acceptTessera(frame)
+    this.acceptTessera(frame, via)
   }
 
-  private acceptTessera(frame: DataFrame): void {
+  private acceptTessera(frame: DataFrame, via: number): void {
     if (this.k === 0) {
       this.k = frame.k
       this.n = frame.n
@@ -256,11 +263,11 @@ export class TeseraReceiver {
     this.noteBuffer()
     if (partial.shards.size >= partial.k) {
       this.probe?.step(frame.blockId, "k", performance.now())
-      this.reconstruct(frame.blockId, partial)
+      this.reconstruct(frame.blockId, partial, via)
     }
   }
 
-  private reconstruct(blockId: number, partial: PartialBlock): void {
+  private reconstruct(blockId: number, partial: PartialBlock, via: number): void {
     if (this.done.has(blockId)) return
     const parts = [...partial.shards.entries()].map(([index, data]) => ({ index, data }))
     let opened: { fin: boolean; body: Buffer; sentAtMs: number }
@@ -302,23 +309,24 @@ export class TeseraReceiver {
     const latencyMs = Math.max(0, Date.now() - opened.sentAtMs)
     this.ready.set(blockId, { body: opened.body, fin: opened.fin, latencyMs })
     this.drain()
-    void this.ackOrHold(blockId).catch((err) => this.fail(err))
+    void this.ackOrHold(blockId, via).catch((err) => this.fail(err))
   }
 
-  private async ackOrHold(blockId: number): Promise<void> {
+  /** `via` is the relay that brought the tessera being answered. Its path just worked, so the ACK goes back on it. */
+  private async ackOrHold(blockId: number, via: number): Promise<void> {
     if (this.unreadBytes >= this.maxUnreadBytes) {
       if (!this.heldAcks.has(blockId)) this.probe?.note("receiver.ack-held", 1)
-      this.heldAcks.add(blockId)
+      this.heldAcks.set(blockId, via)
       return
     }
-    await this.sendAck(blockId)
+    await this.sendAck(blockId, via)
   }
 
   private releaseAcks(): void {
     if (this.heldAcks.size === 0 || this.unreadBytes >= this.maxUnreadBytes || this.stopped) return
-    const ids = [...this.heldAcks]
+    const held = [...this.heldAcks]
     this.heldAcks.clear()
-    for (const id of ids) void this.sendAck(id).catch((err) => this.fail(err))
+    for (const [id, via] of held) void this.sendAck(id, via).catch((err) => this.fail(err))
   }
 
   private drain(): void {
@@ -388,8 +396,10 @@ export class TeseraReceiver {
 
   private pruneAckable(): void {
     const oldest = this.nextDeliver - this.maxAhead
+    // Ids go in as they are delivered, so the set iterates oldest first.
     for (const id of this.ackable) {
-      if (id < oldest) this.ackable.delete(id)
+      if (id >= oldest) break
+      this.ackable.delete(id)
     }
   }
 
@@ -404,8 +414,11 @@ export class TeseraReceiver {
     return true
   }
 
+  /** Ids below `gapsFrom` were looked at once already. One that was missing then is in `missingSince`. */
   private noteGaps(): void {
-    for (let id = this.nextDeliver; id < this.highestSeen; id++) {
+    const from = Math.max(this.nextDeliver, this.gapsFrom)
+    this.gapsFrom = Math.max(this.gapsFrom, this.highestSeen)
+    for (let id = from; id < this.highestSeen; id++) {
       if (this.done.has(id) || this.partials.has(id) || this.ready.has(id) || this.missingSince.has(id)) continue
       this.missingSince.set(id, Date.now())
     }
@@ -474,15 +487,25 @@ export class TeseraReceiver {
     return this.relays.findIndex((relay) => relay.port === remote.port && relay.host === remote.host)
   }
 
-  private async sendAck(blockId: number): Promise<void> {
+  /**
+   * One ACK, on one relay. A lost ACK costs a resend, and the resend arrives as a late tessera that
+   * is answered again on the path it came by.
+   */
+  private async sendAck(blockId: number, via: number): Promise<void> {
     if (!this.sessionId) return
     if (!this.macKey) return
+    const relay = this.relays[via]
+    const sender = this.senders?.[via]
+    const transport = this.transport
+    if (!relay || !sender || !transport) throw new Error("receiver has no return path")
     const probe = this.probe
     const t0 = probe ? performance.now() : 0
     const frame = encodeAck({ kind: "ack", sessionId: this.sessionId, blockId }, this.macKey)
     this.stats.acksSent++
     if (probe) probe.step(blockId, "ack", t0)
-    await this.fanout(frame)
+    const packet = encodeEnvelope(sender, frame)
+    this.stats.controlWireBytes += packet.length
+    await transport.send(packet, relay)
     if (probe) probe.note("receiver.ack-send", performance.now() - t0)
   }
 
