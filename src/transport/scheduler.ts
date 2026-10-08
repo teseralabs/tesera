@@ -134,6 +134,12 @@ export class PathScheduler {
     return rtt * 3
   }
 
+  /** Smoothed round trip to a relay, or 0 before one is measured. */
+  rttMs(relay: number): number {
+    this.at(relay)
+    return this.rtt[relay] ?? 0
+  }
+
   /**
    * Relay a retransmission should use right now. A path that died keeps its old round trip
    * and sheds its queue with every miss, so it looks idle. A path that missed since its last

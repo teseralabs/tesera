@@ -319,13 +319,14 @@ export class TeseraSender {
       probe.note("sender.open-window", this.openWindow())
       probe.step(blockId, "open", t0)
     }
+    const firstWait = this.firstRetxWait(plan)
     const block: BlockState = {
       id: blockId,
       frames,
       placements: frames.map(() => null),
       sends: 1,
-      nextRetxAt: Date.now() + this.retxAfterMs,
-      backoffMs: this.retxAfterMs,
+      nextRetxAt: Date.now() + firstWait,
+      backoffMs: firstWait,
       acked: false,
     }
     if (this.inflight.size === 0) this.lastAckAt = Date.now()
@@ -521,6 +522,18 @@ export class TeseraSender {
       this.fail(err)
       throw this.error ?? asError(err)
     }
+  }
+
+  /**
+   * A block's sample arrives a round trip after its send, and its ACK just after that. A timer
+   * shorter than the path would resend blocks that were already delivered, and cut the window.
+   */
+  private firstRetxWait(plan: Array<number | null>): number {
+    let slowest = 0
+    for (const relay of plan) {
+      if (relay !== null) slowest = Math.max(slowest, this.scheduler.rttMs(relay))
+    }
+    return Math.min(this.maxBackoffMs, Math.max(this.retxAfterMs, slowest * 2))
   }
 
   private openWindow(): number {

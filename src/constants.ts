@@ -9,7 +9,7 @@ export const MAX_N = 32
 /** Keeps one tessera, plus headers, under a conservative UDP payload. */
 export const MAX_SHARD = 1100
 export const DEFAULT_SHARD = 1024
-export const DEFAULT_WINDOW = 32
+export const DEFAULT_WINDOW = 64
 export const DEFAULT_MAX_SENDS = 24
 export const DEFAULT_NACK_AFTER_MS = 40
 export const DEFAULT_RETX_AFTER_MS = 120

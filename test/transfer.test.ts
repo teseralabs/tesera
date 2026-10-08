@@ -497,6 +497,22 @@ describe("transfer", () => {
     assert.equal(output.length, 40_000)
   })
 
+  it("does not keep retransmitting when the round trip is longer than the retransmit timer", async () => {
+    const { output, metrics } = await runTransfer({
+      payload: randomBytes(60_000),
+      k: 1,
+      n: 1,
+      relays: 1,
+      adversity: { delayMs: 80, jitterMs: 30 },
+      retxAfterMs: 120,
+      nackAfterMs: 5_000,
+      deadlineMs: 20_000,
+    })
+    assert.equal(output.length, 60_000)
+    // The first block goes out before any round trip is measured, so only it may be resent.
+    assert.ok(metrics.tesseraRetransmissions <= 1, `${metrics.tesseraRetransmissions} retransmissions`)
+  })
+
   it("does not put plaintext on the relay path", async () => {
     const marker = Buffer.from("this-is-the-plaintext-marker-9f3a")
     const forwarded: Buffer[] = []
