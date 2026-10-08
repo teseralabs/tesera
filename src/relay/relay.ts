@@ -619,17 +619,24 @@ export class Relay {
       return
     }
     const socket = this.socket
+    const sent = () => {
+      this.stats.forwarded++
+      this.stats.forwardedBytes += env.inner.length
+      this.markAnalytics()
+      this.noteForwarded(env.inner)
+      this.noteTransfer(env.inner)
+    }
     const forward = () => {
       if (this.closed) return
       this.announce(env.inner, remote, env.dest)
       this.onForward?.(env.inner)
+      if (this.isSelf(env.dest)) {
+        sent()
+        this.onPacket(env.inner, env.dest)
+        return
+      }
       socket.send(env.inner, env.dest.port, env.dest.host, (err) => {
-        if (err) return
-        this.stats.forwarded++
-        this.stats.forwardedBytes += env.inner.length
-        this.markAnalytics()
-        this.noteForwarded(env.inner)
-        this.noteTransfer(env.inner)
+        if (!err) sent()
       })
     }
     if (decision.waitMs <= 0) {
@@ -666,8 +673,20 @@ export class Relay {
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
     if (this.gate?.admitDatagram(packet.length, session)) return "limited"
     if (this.opts.allowRemote && !this.dests.spend(to, packet.length)) return "limited"
-    this.socket.send(packet, to.port, to.host)
+    if (this.isSelf(to)) this.onPacket(packet, to)
+    else this.socket.send(packet, to.port, to.host)
     return "ok"
+  }
+
+  /**
+   * Whether `to` is this relay's own UDP address. A packet for it is handed straight to `onPacket`
+   * with `to` as its source, which is what the socket would report after a round trip through the
+   * kernel, so every check a looped-back datagram meets still applies.
+   */
+  private isSelf(to: Endpoint): boolean {
+    const bound = this.bound
+    if (bound && bound.host === to.host && bound.port === to.port) return true
+    return this.opts.advertise?.some((address) => address.host === to.host && address.port === to.port) ?? false
   }
 
   /** Count frames this process forwarded, including a tessera sent through here again. */

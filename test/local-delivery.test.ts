@@ -95,6 +95,29 @@ describe("local delivery hook", () => {
     })
   })
 
+  it("hands a local endpoint's packet for an end attached here to local delivery without a UDP send", async () => {
+    const offered: { packet: Buffer; from: Endpoint }[] = []
+    const relay = new Relay({
+      host: "127.0.0.1",
+      identity: generateIdentity(),
+      localDelivery: { deliverReturn: (packet, from) => (offered.push({ packet: Buffer.from(packet), from }), true) },
+    })
+    try {
+      await relay.start()
+      const socket = (relay as unknown as { socket: Socket }).socket
+      let sends = 0
+      const send = socket.send.bind(socket)
+      socket.send = ((...args: Parameters<Socket["send"]>) => (sends++, send(...args))) as Socket["send"]
+      const frame = dataFrame()
+      assert.equal(relay.forwardForLocal(encodeEnvelope(relay.endpoint, frame), relay.endpoint), "ok")
+      assert.deepEqual(offered, [{ packet: frame, from: relay.endpoint }])
+      assert.equal(relay.stats.forwarded, 1)
+      assert.equal(sends, 0)
+    } finally {
+      await relay.close()
+    }
+  })
+
   it("refuses an oversized packet and a non-loopback destination on a loopback relay", async () => {
     await withSink(async ({ relay, sinkAt }) => {
       assert.equal(relay.forwardForLocal(Buffer.alloc(MAX_FORWARD_DATAGRAM + 1), sinkAt), "too-large")
