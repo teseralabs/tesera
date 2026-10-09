@@ -22,7 +22,7 @@ npm pack
 then install the file `npm pack` made, from your application's directory
 
 ```sh
-npm install /path/to/tesera/packages/client/tesera-client-0.1.0-beta.tgz
+npm install /path/to/tesera/packages/client/tesera-client-0.1.1-beta.tgz
 ```
 
 it depends on `@noble/ciphers`, `@noble/hashes`, and `buffer`, and has no native code. its types are web types, so a browser project doesn't need `@types/node`

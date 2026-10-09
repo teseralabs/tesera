@@ -14,6 +14,13 @@ a release is a commit on main that changes `version` here and adds its section b
 
 a change to the protocol version is called out in its section
 
+## 0.1.1-beta
+
+protocol 2
+
+- a browser may hold 1024 incoming WebTransport datagrams, about a megabyte. Chrome's default of one drops a burst while the page is busy. the outgoing queue is unchanged
+- when a send waits because the transport's own window is full, the sender leaves growth and cuts to that transport. a lost acknowledgement cuts the window to 0.9 of its size instead of 0.7
+
 ## 0.1.0-beta
 
 protocol 2
