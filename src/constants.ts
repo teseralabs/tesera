@@ -9,7 +9,10 @@ export const MAX_N = 32
 /** Keeps one tessera, plus headers, under a conservative UDP payload. */
 export const MAX_SHARD = 1100
 export const DEFAULT_SHARD = 1024
-export const DEFAULT_WINDOW = 32
+/** Most blocks a sender keeps in flight. Congestion control decides how many it actually does. */
+export const DEFAULT_WINDOW = 1024
+/** Blocks in flight when a transfer starts. Slow start doubles it every round trip until loss. */
+export const INITIAL_WINDOW = 32
 export const DEFAULT_MAX_SENDS = 24
 export const DEFAULT_NACK_AFTER_MS = 40
 export const DEFAULT_RETX_AFTER_MS = 120
@@ -22,7 +25,10 @@ export const DEFAULT_IDLE_MS = 60_000
 /** How long a receiver keeps acknowledging repeats after the stream ends. */
 export const DEFAULT_ACK_GRACE_MS = 2_000
 export const DEFAULT_TICK_MS = 20
-export const MAX_AHEAD = 256
+/** How far past the next block to deliver a receiver accepts blocks. */
+export const MAX_AHEAD = 2048
+/** What a receiver that doesn't say otherwise accepts. Releases up to 0.3.1 dropped blocks past this. */
+export const LEGACY_AHEAD = 256
 export const DATA_HEADER_LEN = 29
 export const CRC_LEN = 4
 export const ENVELOPE_LEN = 11

@@ -715,7 +715,7 @@ async function runSend(flags: Flags): Promise<void> {
     k: intFlag(flags, "k", 2),
     n: intFlag(flags, "n", 3),
     shardSize: intFlag(flags, "shard", 1024),
-    window: intFlag(flags, "window", 32),
+    window: intFlag(flags, "window", 64),
     maxSends: intFlag(flags, "max-sends", 24),
     retxAfterMs: intFlag(flags, "retx-after-ms", 120),
   })

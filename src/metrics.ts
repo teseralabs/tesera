@@ -56,6 +56,12 @@ export type SenderStats = {
   /** The open window, in blocks, at each block ACK, summed, for a mean. Diagnostics only. */
   windowSum: number
   windowCount: number
+  /** Times loss cut the congestion window. */
+  windowCuts: number
+  /** Cuts reversed because the resend behind them proved spurious. */
+  windowCutsUndone: number
+  /** Losses left to the transport's own congestion control, because it was holding sends back. */
+  windowCutsDeferred: number
 }
 
 export function emptySenderStats(): SenderStats {
@@ -71,6 +77,9 @@ export function emptySenderStats(): SenderStats {
     sampleRttCount: 0,
     windowSum: 0,
     windowCount: 0,
+    windowCuts: 0,
+    windowCutsUndone: 0,
+    windowCutsDeferred: 0,
   }
 }
 

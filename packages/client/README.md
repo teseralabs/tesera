@@ -22,7 +22,7 @@ npm pack
 then install the file `npm pack` made, from your application's directory
 
 ```sh
-npm install /path/to/tesera/packages/client/tesera-client-0.1.0-beta.tgz
+npm install /path/to/tesera/packages/client/tesera-client-0.1.1-beta.tgz
 ```
 
 it depends on `@noble/ciphers`, `@noble/hashes`, and `buffer`, and has no native code. its types are web types, so a browser project doesn't need `@types/node`
@@ -215,7 +215,7 @@ the published WebTransport binaries don't support safari yet. safari requires an
 
 ## versions
 
-this package has its own version, in [CHANGELOG.md](CHANGELOG.md). it speaks tesera wire version 2, the same as the CLI and relays
+this package has its own version. it speaks tesera wire version 2, the same as the CLI and relays
 
 ## development
 

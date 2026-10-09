@@ -372,7 +372,7 @@ they are for the operator and the control plane, not for browsers, so they send 
     "ttl": 86400,
     "wire": 2,
     "implementation": "tesera",
-    "software": "0.3.1-beta",
+    "software": "0.3.2-beta",
     "build": "",
     "manifest": "",
     "capabilities": ["discover", "forward"],

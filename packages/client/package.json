@@ -1,6 +1,6 @@
 {
   "name": "@tesera/client",
-  "version": "0.1.0-beta",
+  "version": "0.1.1-beta",
   "description": "the JavaScript client for tesera: send and receive files and streams over tesera relays, encrypted between the 2 endpoints",
   "keywords": [
     "tesera",
@@ -33,8 +33,7 @@
   "files": [
     "dist/index.js",
     "dist/index.js.map",
-    "dist/types",
-    "CHANGELOG.md"
+    "dist/types"
   ],
   "tesera": {
     "protocol": 2

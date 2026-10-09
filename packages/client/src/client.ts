@@ -178,6 +178,7 @@ export class TeseraClient {
       sessionId: offer.sessionId,
       receiver: { ...connection.endpoint },
       maxPacketSize: connection.maxPacketSize,
+      ahead: receiver.ahead,
     }
     return new IncomingTransfer(answer, offer, receiver, connection, sink, opts, this.probe)
   }
@@ -270,7 +271,7 @@ export class OutgoingTransfer {
   private async run(answer: TransferAnswer): Promise<TransferResult> {
     const parsed = parseAnswer(answer)
     if (parsed.sessionId !== this.offer.sessionId) throw new TeseraError("invalid", "the answer is for another transfer")
-    this.sender.setReceiver(parsed.receiver, parsed.maxPacketSize)
+    this.sender.setReceiver(parsed.receiver, parsed.maxPacketSize, parsed.ahead)
     await this.sender.start().catch((err) => {
       throw asTeseraError(err, "connection")
     })

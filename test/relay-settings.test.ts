@@ -194,7 +194,7 @@ describe("relay settings", () => {
       identity: generateIdentity(),
       log: (line) => lines.push(line),
       logLevel: "info",
-      peerOfflineMs: 80,
+      peerOfflineMs: 500,
       peerTtlMs: 200,
     })
     const joiner = new Relay({ host: "127.0.0.1", identity: generateIdentity(), analyticsFile: file })
@@ -203,11 +203,10 @@ describe("relay settings", () => {
       await joiner.start()
       await joiner.join(seedEndpoint)
       await joiner.publishUsage()
-      await sleep(40)
-      assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 2)
+      await waitUntil(async () => (await readRelaySnapshot(seedEndpoint)).relays === 2)
       assert.equal((await readRelayTable(seedEndpoint)).peers.length, 1)
 
-      await sleep(100)
+      await sleep(600)
       const hidden = await readRelaySnapshot(seedEndpoint)
       assert.equal(hidden.relays, 1)
       assert.equal(hidden.bytes, 50)
@@ -216,12 +215,11 @@ describe("relay settings", () => {
       assert.equal(lines.some((line) => line.includes("event=offline ")), true)
 
       await joiner.publishUsage()
-      await sleep(40)
-      assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 2)
+      await waitUntil(async () => (await readRelaySnapshot(seedEndpoint)).relays === 2)
       assert.equal((await readRelayTable(seedEndpoint)).peers.length, 1)
       assert.equal(lines.some((line) => line.includes("event=online ")), true)
 
-      await sleep(320)
+      await sleep(800)
       const forgotten = await readRelaySnapshot(seedEndpoint)
       assert.equal(forgotten.relays, 1)
       assert.equal(forgotten.bytes, 0)
@@ -229,11 +227,10 @@ describe("relay settings", () => {
       assert.equal(lines.some((line) => line.includes("event=forget ")), true)
 
       await joiner.publishUsage()
-      await sleep(40)
+      await sleep(50)
       assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 1)
       await joiner.join(seedEndpoint)
-      await sleep(40)
-      assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 2)
+      await waitUntil(async () => (await readRelaySnapshot(seedEndpoint)).relays === 2)
     } finally {
       await joiner.close()
       await seed.close()
@@ -339,7 +336,7 @@ describe("relay settings", () => {
     const seed = new Relay({
       host: "127.0.0.1",
       identity: generateIdentity(),
-      peerOfflineMs: 40,
+      peerOfflineMs: 500,
       peerTtlMs: 0,
     })
     const joiner = new Relay({ host: "127.0.0.1", identity: generateIdentity() })
@@ -348,9 +345,8 @@ describe("relay settings", () => {
       await joiner.start()
       await joiner.join(seedEndpoint)
       await joiner.publishUsage()
-      await sleep(20)
-      assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 2)
-      await sleep(50)
+      await waitUntil(async () => (await readRelaySnapshot(seedEndpoint)).relays === 2)
+      await sleep(600)
       assert.equal((await readRelaySnapshot(seedEndpoint)).relays, 1)
       await joiner.publishUsage()
       await sleep(20)
@@ -368,7 +364,7 @@ describe("relay settings", () => {
       host: "127.0.0.1",
       identity: seedId,
       api: { host: "127.0.0.1", port: 0 },
-      peerOfflineMs: 40,
+      peerOfflineMs: 500,
       peerTtlMs: 60_000,
     })
     const joiner = new Relay({ host: "127.0.0.1", identity: joinerId })
@@ -376,20 +372,31 @@ describe("relay settings", () => {
       const bound = await seed.start()
       const api = seed.apiEndpoint
       assert.ok(api)
+      const peers = async () =>
+        (await (await fetch(`http://${api.host}:${api.port}/v1/peers`)).json()) as {
+          relays: Array<{ id: string; online: boolean; seq?: number }>
+        }
       await joiner.start()
       await joiner.join(bound)
       await joiner.publishUsage()
-      await sleep(20)
-      const live = (await (await fetch(`http://${api.host}:${api.port}/v1/peers`)).json()) as {
-        relays: Array<{ id: string; online: boolean; seq?: number }>
-      }
+      const seen: { live: Awaited<ReturnType<typeof peers>> | null } = { live: null }
+      await waitUntil(async () => {
+        const next = await peers()
+        if (next.relays[1]?.id === joinerId.id && next.relays[1]?.online === true) {
+          seen.live = next
+          return true
+        }
+        return false
+      })
+      const live = seen.live
+      assert.ok(live)
       assert.equal(live.relays.length, 2)
       assert.equal(live.relays[0]?.id, seedId.id)
       assert.equal(live.relays[0]?.online, true)
       assert.equal(live.relays[1]?.id, joinerId.id)
       assert.equal(live.relays[1]?.online, true)
       assert.equal("seq" in (live.relays[1] ?? {}), false)
-      await sleep(50)
+      await sleep(600)
       const later = (await (await fetch(`http://${api.host}:${api.port}/v1/peers`)).json()) as {
         relays: Array<{ id: string; online: boolean }>
       }
@@ -585,3 +592,11 @@ describe("relay settings", () => {
     }
   })
 })
+
+async function waitUntil(check: () => Promise<boolean> | boolean, timeoutMs = 2000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (!(await check())) {
+    if (Date.now() > until) throw new Error("timed out waiting")
+    await sleep(10)
+  }
+}

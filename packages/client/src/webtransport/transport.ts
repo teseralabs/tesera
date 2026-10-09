@@ -67,6 +67,13 @@ const MAX_CONTROL_REPLY = 64
  * sender before the answer or a receiver before the first block, says hello this often.
  */
 const KEEPALIVE_MS = 15_000
+/**
+ * Incoming datagrams a browser may hold for this page, about a megabyte. Chrome holds one by
+ * default and drops the rest of a burst that arrives while the page is busy, which a transfer
+ * reads as loss. The outgoing limit stays as it is: past it, a write waits for QUIC's congestion
+ * window, where a longer queue would only drop datagrams inside the browser.
+ */
+const INCOMING_QUEUE = 1024
 
 /** True when this runtime has a global WebTransport. */
 export function webTransportSupported(scope: { WebTransport?: unknown } = globalThis as { WebTransport?: unknown }): boolean {
@@ -146,6 +153,7 @@ async function attach(
     throw err
   }
 
+  widenIncoming(wt.datagrams)
   const maxDatagram = typeof wt.datagrams.maxDatagramSize === "number" ? wt.datagrams.maxDatagramSize : FALLBACK_DATAGRAM
   const writable = wt.datagrams.createWritable ? wt.datagrams.createWritable() : wt.datagrams.writable
   if (!writable) {
@@ -290,6 +298,18 @@ function attachUrl(origin: string): string {
   }
   if (url.protocol !== "https:") throw new TeseraError("invalid", `a WebTransport relay URL must be https, not ${url.protocol}`)
   return new URL(ATTACH_PATH, url).toString()
+}
+
+/** Raise whichever incoming datagram limit this implementation has. Older Chrome names it a high water mark. */
+function widenIncoming(datagrams: object): void {
+  for (const name of ["incomingMaxBufferedDatagrams", "incomingHighWaterMark"]) {
+    if (!(name in datagrams)) continue
+    try {
+      ;(datagrams as Record<string, unknown>)[name] = INCOMING_QUEUE
+    } catch {
+      // A read-only limit stays as the implementation set it.
+    }
+  }
 }
 
 function certificateHash(hex: string): Uint8Array {

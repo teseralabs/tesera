@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { describe, it } from "node:test"
 import { memorySink, TeseraClient, TeseraError, type Progress, type SinkWriter, type Source } from "../src/index.js"
-import { PROTOCOL_VERSION } from "../../../src/constants.js"
+import { DEFAULT_WINDOW, PROTOCOL_VERSION } from "../../../src/constants.js"
 import { CHUNK_BYTES } from "../src/source.js"
 import { memoryWorld, type MemoryWorld } from "./memory-transport.js"
 
@@ -223,7 +223,7 @@ describe("TeseraClient over a custom transport", () => {
 
   it("bounds reading ahead and buffered output behind a slow sink", async () => {
     await withWorld(async (world) => {
-      const payload = randomBytes(2_000_000)
+      const payload = randomBytes(8_000_000)
       const input = counted(payload)
       const slow = collect({ delayMs: 2 })
       const maxBufferedBytes = 64 * 1024
@@ -237,7 +237,7 @@ describe("TeseraClient over a custom transport", () => {
       assert.equal(received.sha256, sha(payload))
       // The sender holds at most its window of blocks plus a source chunk; the receiver its limit plus that
       // window, and one sink write's gathering, which is at most the limit again.
-      const window = 32 * 2023
+      const window = DEFAULT_WINDOW * 2023
       assert.ok(worstAhead <= 2 * maxBufferedBytes + 2 * window + 2 * CHUNK_BYTES, `read ${worstAhead} bytes ahead of the sink`)
       const unread = incoming.diagnostics()["maxUnreadBytes"] ?? Infinity
       assert.ok(unread <= maxBufferedBytes + window + 2023, `receiver held ${unread} unread bytes`)

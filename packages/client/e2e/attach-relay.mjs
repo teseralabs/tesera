@@ -87,6 +87,16 @@ if (file !== null) {
   }
 }
 console.log(JSON.stringify({ udp: relay.endpoint, webtransport: listener.endpoint, certificateHash: cert.hash.toString("hex") }))
+const sendQueue = { maxCount: 0, maxBytes: 0, sumCount: 0, samples: 0 }
+setInterval(() => {
+  const socket = relay["socket"]
+  if (!socket) return
+  const count = socket.getSendQueueCount()
+  sendQueue.maxCount = Math.max(sendQueue.maxCount, count)
+  sendQueue.maxBytes = Math.max(sendQueue.maxBytes, socket.getSendQueueSize())
+  sendQueue.sumCount += count
+  sendQueue.samples++
+}, 5).unref()
 
 process.on("SIGTERM", async () => {
   loop.disable()
@@ -95,6 +105,7 @@ process.on("SIGTERM", async () => {
     cpuSeconds: (used.user + used.system) / 1e6,
     eventLoopDelayMs: { mean: loop.mean / 1e6, p50: loop.percentile(50) / 1e6, p99: loop.percentile(99) / 1e6, max: loop.max / 1e6 },
     counts,
+    sendQueue: { maxCount: sendQueue.maxCount, maxBytes: sendQueue.maxBytes, meanCount: sendQueue.sumCount / Math.max(1, sendQueue.samples) },
     rssMB: process.memoryUsage().rss / 1e6,
   }
   const report = { attach: listener.stats, relay: relay.report(), live: { attachments: listener.attachments.size, sessions: listener.attachments.sessions }, perf, log: lines }

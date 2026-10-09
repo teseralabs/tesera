@@ -32,6 +32,8 @@ export type TransferAnswer = {
   receiver: Endpoint
   /** The largest datagram the receiver's connection accepts. */
   maxPacketSize: number
+  /** How far past its next block to deliver the receiver accepts blocks. Answers from 0.1.0-beta leave it out. */
+  ahead?: number
 }
 
 export function parseOffer(value: unknown): TransferOffer {
@@ -67,11 +69,16 @@ export function parseAnswer(value: unknown): TransferAnswer {
   if (typeof max !== "number" || !Number.isInteger(max) || max < 1) {
     throw new TeseraError("invalid", "an answer needs the receiver's maxPacketSize")
   }
+  const ahead = answer["ahead"]
+  if (ahead !== undefined && !(typeof ahead === "number" && Number.isInteger(ahead) && ahead >= 1)) {
+    throw new TeseraError("invalid", "an answer's ahead must be a whole number of blocks")
+  }
   return {
     v: OFFER_VERSION,
     sessionId: sessionHex(answer["sessionId"]),
     receiver: endpoint(answer["receiver"], "receiver"),
     maxPacketSize: max,
+    ...(ahead !== undefined ? { ahead } : {}),
   }
 }
 

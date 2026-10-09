@@ -64,7 +64,7 @@ describe("peer address per relay", () => {
     })
   })
 
-  it("sends each relay's SAMPLE and ACK to that relay's sender address", async () => {
+  it("answers a tessera with a SAMPLE and an ACK on its relay, to that relay's sender address", async () => {
     await withTaps(async (taps) => {
       const secret = Buffer.alloc(32, 3)
       const senders = taps.map((_, index) => ({ host: "127.0.0.1", port: 9200 + index }))
@@ -72,9 +72,10 @@ describe("peer address per relay", () => {
       const at = await receiver.start()
       try {
         await sendUdp(taps[1]!.socket, dataFrame(secret, randomBytes(16), Buffer.from("hello")), at)
-        await waitFor(() => taps.every((tap) => tap.packets.some((p) => kindOf(p) === "ack")))
+        await waitFor(() => taps[1]!.packets.some((p) => kindOf(p) === "ack"))
         assert.ok(taps[1]!.packets.some((p) => kindOf(p) === "sample"))
-        assert.ok(!taps[0]!.packets.some((p) => kindOf(p) === "sample"))
+        assert.equal(taps[0]!.packets.length, 0)
+        assert.equal(taps[2]!.packets.length, 0)
       } finally {
         await receiver.close()
       }
@@ -93,10 +94,11 @@ describe("peer address per relay", () => {
       receiver.setSender(sender)
       try {
         await sendUdp(taps[0]!.socket, dataFrame(secret, randomBytes(16), Buffer.from("hi")), at)
-        await waitFor(() => taps.every((tap) => tap.packets.length > 0))
+        await waitFor(() => taps[0]!.packets.some((p) => kindOf(p) === "ack"))
       } finally {
         await receiver.close()
       }
+      assert.ok(taps[0]!.packets.length > 0)
       for (const tap of taps) for (const packet of tap.packets) assert.deepEqual(decodeEnvelope(packet)?.dest, sender)
     })
   })
