@@ -60,6 +60,8 @@ export type SenderStats = {
   windowCuts: number
   /** Cuts reversed because the resend behind them proved spurious. */
   windowCutsUndone: number
+  /** Losses left to the transport's own congestion control, because it was holding sends back. */
+  windowCutsDeferred: number
 }
 
 export function emptySenderStats(): SenderStats {
@@ -77,6 +79,7 @@ export function emptySenderStats(): SenderStats {
     windowCount: 0,
     windowCuts: 0,
     windowCutsUndone: 0,
+    windowCutsDeferred: 0,
   }
 }
 

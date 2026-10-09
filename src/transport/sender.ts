@@ -33,6 +33,13 @@ const SAMPLE_STALL_MS = 40
 const CUBIC_BETA = 0.7
 /** CUBIC's growth constant, in blocks per second cubed. */
 const CUBIC_C = 0.4
+/**
+ * A send that waits this long was held back by the transport's own congestion control, as a
+ * WebTransport datagram is when QUIC's window is full. An unheld send returns in well under this.
+ */
+const TRANSPORT_HELD_MS = 2
+/** The cut for a lost ACK on a block the receiver already holds. */
+const ACK_LOSS_BETA = 0.9
 
 type Placement = {
   relay: number
@@ -50,6 +57,8 @@ type BlockState = {
   backoffMs: number
   /** performance.now() of the last resend, 0 before one. */
   resentAt: number
+  /** Tessera indices the receiver sampled, so it holds them. */
+  sampled: Set<number>
   acked: boolean
 }
 
@@ -160,6 +169,9 @@ export class TeseraSender {
   /** performance.now() send time of the newest tessera that has been answered. */
   private newestAnsweredAt = 0
   private undo: Undo | null = null
+  /** performance.now() of the last send the transport held back, and the blocks in flight then. */
+  private blockedAt = -Infinity
+  private blockedInflight = 0
   /** Loss on a block below this id was already answered by the last cut. */
   private recoverFrom = 0
   /** Date.now() of the last block ACK, or of the send that started a busy period. */
@@ -374,6 +386,7 @@ export class TeseraSender {
       nextRetxAt: Date.now() + firstWait,
       backoffMs: firstWait,
       resentAt: 0,
+      sampled: new Set(),
       acked: false,
     }
     if (this.inflight.size === 0) this.lastAckAt = Date.now()
@@ -541,7 +554,9 @@ export class TeseraSender {
     block.resentAt = performance.now()
     block.backoffMs = Math.min(this.maxBackoffMs, block.backoffMs * 2)
     block.nextRetxAt = Date.now() + block.backoffMs
-    this.noteLoss(block.id)
+    // With k tesserae sampled the receiver holds the block, so what went missing was its ACK: often
+    // one random loss, but a return path at an operator's limit drops ACKs too, so it still counts.
+    this.noteLoss(block.id, block.sampled.size >= this.k ? ACK_LOSS_BETA : CUBIC_BETA)
     for (const index of indices) {
       if (this.stopped || block.acked) return
       const place = block.placements[index]
@@ -584,7 +599,12 @@ export class TeseraSender {
     if (retransmission) this.stats.tesseraRetransmissions++
     try {
       await transport.send(packet, relay)
-      if (this.probe) this.probe.note("sender.send", performance.now() - sentAt)
+      const waited = performance.now() - sentAt
+      if (waited >= TRANSPORT_HELD_MS) {
+        this.blockedAt = performance.now()
+        this.blockedInflight = this.inflight.size
+      }
+      if (this.probe) this.probe.note("sender.send", waited)
     } catch (err) {
       this.fail(err)
       throw this.error ?? asError(err)
@@ -618,7 +638,17 @@ export class TeseraSender {
     return !oldest.done && this.nextBlockId >= oldest.value + this.peerAhead
   }
 
+  /**
+   * The transport held a send back within the last round trip or two. Its own congestion control
+   * is pacing the first hop, so more window would only queue inside it, and a datagram it expired
+   * there was already answered by that control slowing down.
+   */
+  private transportHeld(): boolean {
+    return performance.now() - this.blockedAt < 2 * (this.smoothedRttMs || DEFAULT_RETX_AFTER_MS)
+  }
+
   private grow(): void {
+    if (this.transportHeld()) return
     if (this.congestion < this.slowStartUntil) {
       this.congestion = Math.min(this.window, this.congestion + 1)
       return
@@ -639,10 +669,16 @@ export class TeseraSender {
    * window, so one burst counts once, and never below MIN_WINDOW, so random
    * loss cannot starve the transfer.
    */
-  private noteLoss(blockId: number): void {
+  private noteLoss(blockId: number, beta: number): void {
     // Before any round trip is measured, a resend is a guess about the path, not a sign of a full queue.
     if (!this.scheduler.hasObservation) return
     if (blockId < this.recoverFrom) return
+    if (this.transportHeld()) {
+      // The transport was full at this many blocks, so a window past it is only queue inside the transport.
+      this.congestion = Math.max(Math.min(this.window, MIN_WINDOW), Math.min(this.congestion, this.blockedInflight))
+      this.stats.windowCutsDeferred++
+      return
+    }
     const recoverFrom = this.recoverFrom
     this.recoverFrom = this.nextBlockId
     const floor = Math.min(this.window, MIN_WINDOW)
@@ -656,11 +692,11 @@ export class TeseraSender {
       recoverFrom,
     }
     // A loss before the window regained its last peak means less room now, so aim lower.
-    this.lossWindow = this.congestion < this.lossWindow ? (this.congestion * (1 + CUBIC_BETA)) / 2 : this.congestion
-    this.congestion = Math.max(floor, this.congestion * CUBIC_BETA)
+    this.lossWindow = this.congestion < this.lossWindow ? (this.congestion * (1 + beta)) / 2 : this.congestion
+    this.congestion = Math.max(floor, this.congestion * beta)
     this.slowStartUntil = this.congestion
     this.growthFrom = performance.now()
-    this.growthPeakSec = Math.cbrt((this.lossWindow * (1 - CUBIC_BETA)) / CUBIC_C)
+    this.growthPeakSec = Math.cbrt((this.lossWindow * (1 - beta)) / CUBIC_C)
     this.stats.windowCuts++
     this.probe?.note("sender.window-cut", this.congestion)
   }
@@ -690,6 +726,7 @@ export class TeseraSender {
   private noteSample(blockId: number, index: number): void {
     const key = this.sampleKey(blockId, index)
     this.lossWatch.delete(key)
+    this.inflight.get(blockId)?.sampled.add(index)
     const pending = this.awaitingSample.get(key)
     if (!pending) return
     this.awaitingSample.delete(key)
@@ -753,6 +790,8 @@ export class TeseraSender {
       sent.push(index)
       if (!place.settled) unsettled.push(index)
     }
+    // The receiver holds the block and answers any late tessera with its ACK again, so one is enough.
+    if (block.sampled.size >= this.k) return sent.slice(0, 1)
     return unsettled.length > 0 ? unsettled : sent
   }
 
