@@ -45,6 +45,11 @@ const { values: args } = parseArgs({
     k: { type: "string" },
     n: { type: "string" },
     "fixed-window": { type: "boolean", default: false },
+    "old-cc": { type: "boolean", default: false },
+    "narrow-incoming": { type: "boolean", default: false },
+    "send-browser": { type: "string" },
+    "recv-browser": { type: "string" },
+    firefox: { type: "string", default: "/Applications/Firefox.app/Contents/MacOS/firefox" },
     "max-buffered": { type: "string" },
     label: { type: "string" },
     "udp-cli": { type: "string", default: new URL("../../../tmp/v021/dist/src/cli.js", import.meta.url).pathname },
@@ -77,7 +82,7 @@ const loss = Number(args.loss)
 const window = args.window ? Number(args.window) : null
 const label =
   args.label ??
-  `${args.production ? `live-${args.production}-${args["fixed-window"] ? "fixed-" : ""}` : ""}path${path}-${args.size}${delayMs ? `-delay${delayMs}` : ""}${jitterMs ? `-jitter${jitterMs}` : ""}${loss ? `-loss${loss}` : ""}${window ? `-window${window}` : ""}${args.shard ? `-shard${args.shard}` : ""}${args.sink !== "opfs" ? `-sink${args.sink}` : ""}${args.paths !== "3" ? `-paths${args.paths}` : ""}${args["kill-relay"] ? "-kill" : ""}${args.probe ? "-probe" : ""}`
+  `${args.production ? `live-${args.production}-${args["fixed-window"] ? "fixed-" : ""}` : ""}${args["send-browser"] ? `${args["send-browser"]}-` : ""}${args["recv-browser"] ? `to-${args["recv-browser"]}-` : ""}path${path}-${args.size}${delayMs ? `-delay${delayMs}` : ""}${jitterMs ? `-jitter${jitterMs}` : ""}${loss ? `-loss${loss}` : ""}${window ? `-window${window}` : ""}${args.shard ? `-shard${args.shard}` : ""}${args.sink !== "opfs" ? `-sink${args.sink}` : ""}${args.paths !== "3" ? `-paths${args.paths}` : ""}${args["kill-relay"] ? "-kill" : ""}${args.probe ? "-probe" : ""}`
 
 // The page, built with the window this run asks for. Only the benchmark build changes it.
 const windowPlugin = {
@@ -93,8 +98,20 @@ const windowPlugin = {
     b.onLoad({ filter: /src\/transport\/sender\.ts$/ }, (found) => {
       let text = readFileSync(found.path, "utf8")
       if (args["fixed-window"]) text = text.replace("if (!this.scheduler.hasObservation) return", "return")
+      // --old-cc builds the sender as before: no deferring to a transport that holds sends back, and a lost ACK cuts like lost data.
+      if (args["old-cc"]) {
+        text = text.replaceAll("this.transportHeld()", "false")
+        text = text.replace("block.sampled.size >= this.k ? ACK_LOSS_BETA : CUBIC_BETA", "CUBIC_BETA").replace("if (block.sampled.size >= this.k) return sent.slice(0, 1)", "")
+      }
       return { contents: text, loader: "ts" }
     })
+    // --narrow-incoming leaves the browser's incoming datagram limit where it was, usually 1.
+    if (args["narrow-incoming"]) {
+      b.onLoad({ filter: /webtransport\/transport\.ts$/ }, (found) => ({
+        contents: readFileSync(found.path, "utf8").replace("widenIncoming(wt.datagrams)", ""),
+        loader: "ts",
+      }))
+    }
   },
 }
 if (ends.includes("chrome")) {
@@ -181,7 +198,11 @@ async function runOnce(index) {
   const browsers = {}
   const natives = {}
   for (const [role, kind] of [["send", ends[0]], ["recv", ends[1]]]) {
-    if (kind === "chrome") {
+    const other = args[`${role}-browser`]
+    if (kind === "chrome" && other && other !== "chrome") {
+      browsers[role] = openBrowser(other, `${base}/${role}?role=${role}`, `${out}${other}-${role}`)
+      children.add(browsers[role].proc)
+    } else if (kind === "chrome") {
       const profile = `${out}chrome-${role}`
       rmSync(profile, { recursive: true, force: true, maxRetries: 3 })
       const browser = launch(args.chrome, profile)
@@ -254,6 +275,7 @@ async function runOnce(index) {
     tesseraePerBlock: sd.blocks ? sd.tesseraSends / sd.blocks : null,
     retransmissions: sd.tesseraRetransmissions ?? null,
     windowCuts: sd.windowCuts ?? null,
+    windowCutsDeferred: sd.windowCutsDeferred ?? null,
     meanSampleRttMs: sd.sampleRttCount ? sd.sampleRttSumMs / sd.sampleRttCount : null,
     meanOpenWindow: sd.windowCount ? sd.windowSum / sd.windowCount : null,
     nacksSent: rd.nacksSent ?? null,
@@ -275,7 +297,7 @@ async function runOnce(index) {
   writeFileSync(`${out}${label}-${index}.json`, JSON.stringify(run, null, 2))
   step(
     `${label} #${index}: ${ok ? "ok" : "FAIL"} ${mbps?.toFixed(2)} MB/s (steady ${run.steadyMBps?.toFixed(2)}) over ${run.seconds?.toFixed(1)} s; ` +
-      `datagram ${run.datagram}, ${run.tesseraePerBlock?.toFixed(2)} tesserae/block, ${run.retransmissions} retx, ${run.windowCuts} cuts, rtt ${run.meanSampleRttMs?.toFixed(1)} ms, window ${run.meanOpenWindow?.toFixed(1)}; ` +
+      `datagram ${run.datagram}, ${run.tesseraePerBlock?.toFixed(2)} tesserae/block, ${run.retransmissions} retx, ${run.windowCuts} cuts (${run.windowCutsDeferred} deferred), rtt ${run.meanSampleRttMs?.toFixed(1)} ms, window ${run.meanOpenWindow?.toFixed(1)}; ` +
       `cpu ${JSON.stringify(cpu)}; mem ${JSON.stringify(run.memoryPeakMB)}`,
   )
   return run
@@ -328,6 +350,33 @@ function topAllocation(heap) {
   }
   walk(heap.head)
   return { totalMB: Math.round(all / 1e5) / 10, top: [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([name, bytes]) => [name, Math.round(bytes / 1e5) / 10]) }
+}
+
+/**
+ * A page in Firefox, headless in its own profile, or in Safari, opened in the background. Neither
+ * speaks the DevTools protocol, so there is no page heap or profile, only the process tree's memory.
+ */
+function openBrowser(name, url, profile) {
+  if (name === "firefox") {
+    rmSync(profile, { recursive: true, force: true })
+    mkdirSync(profile, { recursive: true })
+    const proc = spawn(args.firefox, ["--headless", "--no-remote", "--profile", profile, url], { stdio: "ignore" })
+    return { proc, close: async () => void proc.kill("SIGTERM") }
+  }
+  if (name === "safari") {
+    const proc = spawn("open", ["-g", "-a", "Safari", url], { stdio: "ignore" })
+    const origin = new URL(url).origin
+    return {
+      proc,
+      close: async () => {
+        const script = `tell application "Safari" to close (every tab of every window whose URL starts with "${origin}")`
+        try {
+          execFileSync("osascript", ["-e", script])
+        } catch {}
+      },
+    }
+  }
+  throw new Error(`--send-browser and --recv-browser are chrome, firefox, or safari, not ${name}`)
 }
 
 /** The live network's entry relay and UDP relays: `fast` is the entry relay alone, `distributed` every listed relay. */
