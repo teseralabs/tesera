@@ -33,8 +33,7 @@
   "files": [
     "dist/index.js",
     "dist/index.js.map",
-    "dist/types",
-    "CHANGELOG.md"
+    "dist/types"
   ],
   "tesera": {
     "protocol": 2

@@ -215,7 +215,7 @@ the published WebTransport binaries don't support safari yet. safari requires an
 
 ## versions
 
-this package has its own version, in [CHANGELOG.md](CHANGELOG.md). it speaks tesera wire version 2, the same as the CLI and relays
+this package has its own version. it speaks tesera wire version 2, the same as the CLI and relays
 
 ## development
 
