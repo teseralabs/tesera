@@ -552,16 +552,26 @@ export class Relay {
     if (socket) await closeUdp(socket).catch(() => {})
   }
 
-  private onPacket(msg: Buffer, remote: Endpoint): void {
-    if (this.closed || !this.socket) return
+  /**
+   * `admitted` is set only by `forwardForLocal`, and only after that call has already admitted the
+   * envelope and spent its destination allowance. The handoff stays inside this process, so charging
+   * that same address again would bill one delivery twice. A datagram that arrived on the socket
+   * leaves it false and is admitted here. An envelope whose destination is a different address is
+   * still spent below, because that address was not the one `forwardForLocal` charged.
+   *
+   * Returns whether the frame was accepted: delivered to a local endpoint, sent onward, or queued
+   * for the simulated network. A refusal returns false.
+   */
+  private onPacket(msg: Buffer, remote: Endpoint, admitted = false): boolean {
+    if (this.closed || !this.socket) return false
     if (isIdentityPacket(msg)) {
       this.noteReturn(remote, msg)
       this.answer(msg, remote)
-      return
+      return true
     }
     if (msg.length > MAX_FORWARD_DATAGRAM) {
       this.stats.droppedInvalid++
-      return
+      return false
     }
     const env = decodeEnvelope(msg)
     if (!env) {
@@ -570,53 +580,56 @@ export class Relay {
         // A matched return frame proves this source is a real relay we forward to, even though a bare
         // frame is not structural on its own, so reopen its destination budget directly.
         this.markReturningDest(remote)
-        return
+        return true
       }
       this.stats.droppedInvalid++
-      return
+      return false
     }
     // Forwarding an inner envelope would chain relays and hide the frame's session from admission.
     if (startsEnvelope(env.inner)) {
       this.stats.droppedInvalid++
-      return
+      return false
     }
     // A forwarded identity packet would reach the next relay as if this relay sent it, and start handshakes in its name.
     if (startsIdentity(env.inner)) {
       this.stats.droppedInvalid++
-      return
+      return false
     }
     this.noteReturn(remote, msg)
     if (!this.opts.allowRemote && !isLoopback(env.dest.host)) {
       this.stats.droppedDenied++
-      return
+      return false
     }
     if (this.opts.allowRemote && !destinationAllowed(env.dest.host, this.allowDest)) {
       this.stats.droppedDenied++
-      return
+      return false
     }
     if (this.endpointBlocked(remote)) {
       this.stats.droppedDenied++
-      return
+      return false
     }
     if (this.opts.correlated && peekRelayFrame(env.inner)?.kind === "data" && this.opts.correlated.closedNow()) {
       this.stats.droppedLoss++
-      return
+      return false
     }
     const decision = this.admit(msg.length)
     if (decision.action === "drop") {
       if (decision.reason === "blackhole") this.stats.droppedBlackhole++
       else this.stats.droppedLoss++
-      return
+      return false
     }
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
-    const limited = this.gate?.admitDatagram(msg.length, session) ?? null
-    if (limited) {
-      this.limit(limited)
-      return
+    if (!admitted) {
+      const limited = this.gate?.admitDatagram(msg.length, session) ?? null
+      if (limited) {
+        this.limit(limited)
+        return false
+      }
     }
-    if (this.opts.allowRemote && !this.dests.spend(env.dest, env.inner.length)) {
+    const spentWithAdmission = admitted && env.dest.host === remote.host && env.dest.port === remote.port
+    if (this.opts.allowRemote && !spentWithAdmission && !this.dests.spend(env.dest, env.inner.length)) {
       this.limit("destination")
-      return
+      return false
     }
     const socket = this.socket
     const sent = () => {
@@ -626,28 +639,31 @@ export class Relay {
       this.noteForwarded(env.inner)
       this.noteTransfer(env.inner)
     }
-    const forward = () => {
-      if (this.closed) return
+    const forward = (): boolean => {
+      if (this.closed) return false
+      if (this.isSelf(env.dest)) {
+        // The inner frame is not an envelope, so this call delivers it and does not admit it.
+        const accepted = this.onPacket(env.inner, env.dest)
+        if (!accepted) return false
+        sent()
+        this.announce(env.inner, remote, env.dest)
+        this.onForward?.(env.inner)
+        return true
+      }
       this.announce(env.inner, remote, env.dest)
       this.onForward?.(env.inner)
-      if (this.isSelf(env.dest)) {
-        sent()
-        this.onPacket(env.inner, env.dest)
-        return
-      }
       socket.send(env.inner, env.dest.port, env.dest.host, (err) => {
         if (!err) sent()
       })
+      return true
     }
-    if (decision.waitMs <= 0) {
-      forward()
-      return
-    }
+    if (decision.waitMs <= 0) return forward()
     const timer = setTimeout(() => {
       this.timers.delete(timer)
       forward()
     }, decision.waitMs)
     this.timers.add(timer)
+    return true
   }
 
   /**
@@ -671,17 +687,30 @@ export class Relay {
     if (startsEnvelope(env.inner)) return "invalid"
     if (startsIdentity(env.inner)) return "invalid"
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
-    if (this.gate?.admitDatagram(packet.length, session)) return "limited"
-    if (this.opts.allowRemote && !this.dests.spend(to, packet.length)) return "limited"
-    if (this.isSelf(to)) this.onPacket(packet, to)
-    else this.socket.send(packet, to.port, to.host)
-    return "ok"
+    const limited = this.gate?.admitDatagram(packet.length, session) ?? null
+    if (limited) {
+      // The same counters a UDP arrival uses. A refusal here is the only charge, so it is counted once.
+      this.limit(limited)
+      return "limited"
+    }
+    if (this.opts.allowRemote && !this.dests.spend(to, packet.length)) {
+      this.limit("destination")
+      return "limited"
+    }
+    if (!this.isSelf(to)) {
+      this.socket.send(packet, to.port, to.host)
+      return "ok"
+    }
+    // Already admitted above. The in-process handoff must not admit this envelope again, and "ok"
+    // means the frame was accepted for delivery rather than dropped on the way through.
+    return this.onPacket(packet, to, true) ? "ok" : "invalid"
   }
 
   /**
    * Whether `to` is this relay's own UDP address. A packet for it is handed straight to `onPacket`
    * with `to` as its source, which is what the socket would report after a round trip through the
-   * kernel, so every check a looped-back datagram meets still applies.
+   * kernel, so every check a looped-back datagram meets still applies except the operator admission
+   * `forwardForLocal` has already done.
    */
   private isSelf(to: Endpoint): boolean {
     const bound = this.bound
