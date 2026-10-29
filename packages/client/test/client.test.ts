@@ -2,8 +2,10 @@ import assert from "node:assert/strict"
 import { createHash, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { describe, it } from "node:test"
-import { memorySink, TeseraClient, TeseraError, type Progress, type SinkWriter, type Source } from "../src/index.js"
-import { DEFAULT_WINDOW, PROTOCOL_VERSION } from "../../../src/constants.js"
+import { memorySink, TeseraClient, TeseraError, type ClientTransport, type Progress, type SinkWriter, type Source, type TransportEvents } from "../src/index.js"
+import { reportedFailure } from "../src/errors.js"
+import { CRC_LEN, DATA_HEADER_LEN, DEFAULT_WINDOW, FRAME_DATA, PROTOCOL_VERSION } from "../../../src/constants.js"
+import { crc32 } from "../../../src/protocol/crc32.js"
 import { CHUNK_BYTES } from "../src/source.js"
 import { memoryWorld, type MemoryWorld } from "./memory-transport.js"
 
@@ -70,6 +72,8 @@ async function pair(
     onSendProgress?: (p: Progress) => void
     onRecvProgress?: (p: Progress) => void
     sendSignal?: AbortSignal
+    recvSignal?: AbortSignal
+    idleMs?: number
   } = {},
 ) {
   const sendTransport = world.transport(opts.senderPacket)
@@ -90,6 +94,8 @@ async function pair(
     hash: true,
     onProgress: opts.onRecvProgress,
     maxBufferedBytes: opts.maxBufferedBytes,
+    signal: opts.recvSignal,
+    idleMs: opts.idleMs,
   })
   return { outgoing, incoming, out, sendTransport, recvTransport }
 }
@@ -241,6 +247,57 @@ describe("TeseraClient over a custom transport", () => {
       assert.ok(worstAhead <= 2 * maxBufferedBytes + 2 * window + 2 * CHUNK_BYTES, `read ${worstAhead} bytes ahead of the sink`)
       const unread = incoming.diagnostics()["maxUnreadBytes"] ?? Infinity
       assert.ok(unread <= maxBufferedBytes + window + 2023, `receiver held ${unread} unread bytes`)
+    })
+  })
+})
+
+describe("peer close", () => {
+  it("tells the receiver when the sender cancels, and aborts the partial sink", async () => {
+    await withWorld(async (world) => {
+      const payload = randomBytes(2_000_000)
+      const sink = collect({ delayMs: 1 })
+      const { outgoing, incoming } = await pair(world, payload, { sink: sink.sink, idleMs: 5_000 })
+      const started = outgoing.start(incoming.answer)
+      assert.ok(await settled(() => sink.bytes().length > 0, 4_000))
+      outgoing.cancel()
+      const err = await incoming.done.then(
+        () => {
+          throw new Error("the receiver finished")
+        },
+        (caught: unknown) => caught,
+      )
+      assert.ok(err instanceof TeseraError)
+      assert.equal(err.reason, "sender")
+      assert.equal(err.message, "the sender cancelled the transfer")
+      assert.ok(sink.aborted() instanceof TeseraError)
+      assert.equal((sink.aborted() as TeseraError).reason, "sender")
+      assert.equal(sink.closed(), false)
+      await started.catch(() => {})
+    })
+  })
+
+  it("tells the sender when the receiver cancels", async () => {
+    await withWorld(async (world) => {
+      const payload = randomBytes(2_000_000)
+      const { outgoing, incoming } = await pair(world, payload, { idleMs: 5_000 })
+      const started = outgoing.start(incoming.answer)
+      assert.ok(await settled(() => (outgoing.diagnostics().inputBytes ?? 0) > 0, 4_000))
+      incoming.cancel()
+      const err = await started.then(
+        () => {
+          throw new Error("the sender finished")
+        },
+        (caught: unknown) => caught,
+      )
+      assert.ok(err instanceof TeseraError)
+      assert.equal(err.reason, "receiver")
+      assert.equal(err.message, "the receiver cancelled the transfer")
+      await assert.rejects(incoming.done, (caught: unknown) => {
+        assert.ok(caught instanceof TeseraError)
+        assert.equal(caught.code, "cancelled")
+        assert.equal(caught.reason, undefined)
+        return true
+      })
     })
   })
 })
@@ -415,7 +472,11 @@ describe("errors", () => {
       const sink = collect({ failAt: 200_000 })
       const { outgoing, incoming, recvTransport } = await pair(world, randomBytes(1_000_000), { sink: sink.sink })
       void outgoing.start(incoming.answer).catch(() => {})
-      await rejectsWith(incoming.done, "sink")
+      const err = await rejected(incoming.done)
+      assert.equal(err.code, "sink")
+      assert.match(err.message, /disk full/)
+      assert.equal((sink.aborted() as TeseraError).code, "sink")
+      assert.match((sink.aborted() as TeseraError).message, /disk full/)
       assert.ok(await settled(() => recvTransport.open() === 0))
       outgoing.cancel()
     })
@@ -470,3 +531,208 @@ describe("errors", () => {
     })
   })
 })
+
+describe("failure reports", () => {
+  it("keeps a specific failure when a local cancel races it", () => {
+    const integrity = new TeseraError("transfer", "block 3 failed integrity check: tag mismatch", { reason: "integrity" })
+    const kept = reportedFailure(integrity, true)
+    assert.equal(kept, integrity)
+    const stalled = reportedFailure(new Error("no block was acknowledged for 60s"), true)
+    assert.equal(stalled.code, "transfer")
+    assert.equal(stalled.reason, "idle")
+    assert.match(stalled.message, /no block was acknowledged/)
+    const closed = reportedFailure(new Error("receiver closed before completion"), true)
+    assert.equal(closed.code, "cancelled")
+    const attached = reportedFailure(new TeseraError("connection", "the relay closed the attachment", { reason: "closed" }), false)
+    assert.equal(attached.code, "connection")
+    assert.equal(attached.reason, "closed")
+    const sender = reportedFailure(new Error("the sender cancelled the transfer"), false)
+    assert.equal(sender.code, "cancelled")
+    assert.equal(sender.reason, "sender")
+    const dropped = reportedFailure(new Error("the relay closed the attachment"), false)
+    assert.equal(dropped.code, "connection")
+    assert.equal(dropped.reason, "closed")
+  })
+
+  it("fails a stalled receive as idle, not cancelled", async () => {
+    await withWorld(async (world) => {
+      let delivered = 0
+      const recvTransport = dropAfter(world.transport(), 40, () => delivered++)
+      const sender = new TeseraClient({ transport: world.transport() })
+      const receiver = new TeseraClient({ transport: recvTransport })
+      const outgoing = await sender.send(randomBytes(2_000_000), { relays: world.relays.map((r) => r.endpoint) })
+      const incoming = await receiver.receive({
+        offer: JSON.parse(JSON.stringify(outgoing.offer)),
+        secret: outgoing.secret,
+        sink: collect().sink,
+        idleMs: 300,
+      })
+      void outgoing.start(incoming.answer).catch(() => {})
+      const err = await rejected(incoming.done)
+      assert.equal(err.code, "transfer")
+      assert.equal(err.reason, "idle")
+      assert.match(err.message, /no progress for/)
+      assert.ok(delivered > 0)
+      outgoing.cancel()
+    })
+  })
+
+  it("reports an attachment that closes as a dropped connection", async () => {
+    await withWorld(async (world) => {
+      const recvTransport = failAfter(world.transport(), 20, new TeseraError("connection", "the relay closed the attachment", { reason: "closed" }))
+      const sender = new TeseraClient({ transport: world.transport() })
+      const receiver = new TeseraClient({ transport: recvTransport })
+      const outgoing = await sender.send(randomBytes(1_000_000), { relays: world.relays.map((r) => r.endpoint) })
+      const incoming = await receiver.receive({
+        offer: JSON.parse(JSON.stringify(outgoing.offer)),
+        secret: outgoing.secret,
+        sink: collect().sink,
+      })
+      void outgoing.start(incoming.answer).catch(() => {})
+      const err = await rejected(incoming.done)
+      assert.equal(err.code, "connection")
+      assert.equal(err.reason, "closed")
+      assert.match(err.message, /closed the attachment/)
+      outgoing.cancel()
+    })
+  })
+
+  it("finishes when one tessera index is corrupt and the others are intact", async () => {
+    await withWorld(async (world) => {
+      const payload = randomBytes(80_000)
+      const recvTransport = corruptIndex(world.transport(), 0)
+      const sender = new TeseraClient({ transport: world.transport() })
+      const receiver = new TeseraClient({ transport: recvTransport })
+      const saved = collect()
+      const outgoing = await sender.send(payload, { relays: world.relays.map((r) => r.endpoint) })
+      const incoming = await receiver.receive({
+        offer: JSON.parse(JSON.stringify(outgoing.offer)),
+        secret: outgoing.secret,
+        sink: saved.sink,
+      })
+      const [, received] = await Promise.all([outgoing.start(incoming.answer), incoming.done])
+      assert.equal(received.bytes, payload.length)
+      assert.ok(saved.bytes().equals(payload))
+    })
+  })
+
+  it("reports a block that fails its integrity check", async () => {
+    await withWorld(async (world) => {
+      const recvTransport = corruptData(world.transport())
+      const sender = new TeseraClient({ transport: world.transport() })
+      const receiver = new TeseraClient({ transport: recvTransport })
+      const outgoing = await sender.send(randomBytes(80_000), { relays: world.relays.map((r) => r.endpoint) })
+      const incoming = await receiver.receive({
+        offer: JSON.parse(JSON.stringify(outgoing.offer)),
+        secret: outgoing.secret,
+        sink: collect().sink,
+      })
+      void outgoing.start(incoming.answer).catch(() => {})
+      const err = await rejected(incoming.done)
+      assert.equal(err.code, "transfer")
+      assert.equal(err.reason, "integrity")
+      assert.match(err.message, /failed integrity check/)
+      outgoing.cancel()
+    })
+  })
+
+  it("reports an abort reason as that error, not as a cancel", async () => {
+    await withWorld(async (world) => {
+      const abort = new AbortController()
+      const { outgoing, incoming } = await pair(world, randomBytes(2_000_000), { recvSignal: abort.signal, sink: collect({ delayMs: 5 }).sink })
+      void outgoing.start(incoming.answer).catch(() => {})
+      abort.abort(new TeseraError("transfer", "no progress for 30 s", { reason: "idle" }))
+      const err = await rejected(incoming.done)
+      assert.equal(err.code, "transfer")
+      assert.equal(err.reason, "idle")
+      outgoing.cancel()
+    })
+  })
+})
+
+function rejected(promise: Promise<unknown>): Promise<TeseraError> {
+  return promise.then(
+    () => {
+      throw new Error("expected a rejection")
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof TeseraError, `expected a TeseraError, got ${String(err)}`)
+      return err
+    },
+  )
+}
+
+/** Delivers data frames until `limit`, then drops them. Control frames still pass. */
+function dropAfter(inner: ClientTransport, limit: number, count: () => number): ClientTransport {
+  let seen = 0
+  return {
+    name: inner.name,
+    connect: (events, signal, hints) =>
+      inner.connect(gated(events, (packet, deliver) => {
+        if (packet[1] === FRAME_DATA && ++seen > limit) return
+        count()
+        deliver()
+      }), signal, hints),
+  }
+}
+
+function failAfter(inner: ClientTransport, limit: number, failure: TeseraError): ClientTransport {
+  let seen = 0
+  return {
+    name: inner.name,
+    connect: (events, signal, hints) =>
+      inner.connect(gated(events, (packet, deliver, fail) => {
+        if (packet[1] === FRAME_DATA && ++seen > limit) {
+          fail(failure)
+          return
+        }
+        deliver()
+      }), signal, hints),
+  }
+}
+
+/** Flips a payload byte of one tessera index and repairs the checksum. */
+function corruptIndex(inner: ClientTransport, index: number): ClientTransport {
+  return {
+    name: inner.name,
+    connect: (events, signal, hints) =>
+      inner.connect(gated(events, (packet, deliver) => {
+        if (packet.length < DATA_HEADER_LEN + CRC_LEN + 1 || packet[1] !== FRAME_DATA || packet[22] !== index) {
+          deliver()
+          return
+        }
+        const copy = Buffer.from(packet)
+        copy.writeUInt8(copy.readUInt8(DATA_HEADER_LEN) ^ 0xff, DATA_HEADER_LEN)
+        copy.writeUInt32BE(crc32(copy.subarray(0, copy.length - CRC_LEN)), copy.length - CRC_LEN)
+        deliver(copy)
+      }), signal, hints),
+  }
+}
+
+/** Flips a payload byte and repairs the checksum, so the frame parses and the block check fails. */
+function corruptData(inner: ClientTransport): ClientTransport {
+  return {
+    name: inner.name,
+    connect: (events, signal, hints) =>
+      inner.connect(gated(events, (packet, deliver) => {
+        if (packet.length < DATA_HEADER_LEN + CRC_LEN + 1 || packet[1] !== FRAME_DATA) {
+          deliver()
+          return
+        }
+        const copy = Buffer.from(packet)
+        copy.writeUInt8(copy.readUInt8(DATA_HEADER_LEN) ^ 0xff, DATA_HEADER_LEN)
+        copy.writeUInt32BE(crc32(copy.subarray(0, copy.length - CRC_LEN)), copy.length - CRC_LEN)
+        deliver(copy)
+      }), signal, hints),
+  }
+}
+
+function gated(
+  events: TransportEvents,
+  onPacket: (packet: Uint8Array, deliver: (packet?: Uint8Array) => void, fail: (err: TeseraError) => void) => void,
+): TransportEvents {
+  return {
+    packet: (packet, from) => onPacket(packet, (next = packet) => events.packet(next, from), (err) => events.error(err)),
+    error: (err) => events.error(err),
+  }
+}

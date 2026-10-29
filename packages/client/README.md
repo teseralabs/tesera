@@ -132,9 +132,9 @@ when the sink falls behind, the receiver holds its acknowledgements once `maxBuf
 
 pass an `AbortSignal` as `signal`, or call `cancel()`, on a transfer or a share
 
-it stops reading and writing, aborts the sink, closes the attachment, and releases the session at the relay. `done` or `start` rejects with a `cancelled` error. a cancel after `done` resolves changes nothing
+it stops reading and writing, aborts the sink, tells the other end with one authenticated close notice, closes the attachment, and releases the session at the relay. `done` or `start` rejects with a `cancelled` error. a cancel after `done` resolves changes nothing
 
-the other end isn't told. it stops when its timers run out
+the notice is best effort. a peer that never receives it, including one that doesn't understand it, still stops on its idle timeout. closing a tab may not leave time for the notice to be sent. a dropped attachment, with no notice, stays a connection failure
 
 ## relays and coded paths
 
@@ -163,12 +163,12 @@ Node.js 20 or newer needs a WebTransport implementation passed as `WebTransport`
 every failure is a `TeseraError` with a `code`
 
 - `unsupported`: no WebTransport here
-- `connection`: the attachment relay can't be reached, its certificate doesn't match, or the connection closed
+- `connection`: the attachment relay can't be reached, its certificate doesn't match, or the connection closed. `reason` is `closed` when an attachment that was already up goes away. a failure while connecting leaves `reason` unset
 - `incompatible`: a different attach version, or an offer or answer from a different version
 - `claim`: the receiver's relay already holds the session, or as many as it allows
 - `path`: the attachment relay can't reach an address in the offer
-- `transfer`: the transfer stopped making progress, or a block failed its checks
-- `cancelled`: you cancelled it
+- `transfer`: the transfer failed in flight. `reason` is `idle` when nothing arrived in time, `integrity` when a block failed its checks, or `stopped` when the cause is neither. a peer that goes silent is `idle`
+- `cancelled`: you cancelled it, or an authenticated close said the other peer stopped. `reason` is `sender` or `receiver` when that peer cancelled, and `peer` when that peer stopped because it failed
 - `source`: reading the source failed
 - `sink`: writing the sink failed
 - `invalid`: an argument, offer, answer, or secret is malformed

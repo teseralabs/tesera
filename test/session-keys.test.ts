@@ -157,6 +157,7 @@ describe("per-sender keys", () => {
     const boundRx = await receiver.start()
     try {
       await sendUdp(socket, forged, boundRx)
+      await sendUdp(socket, forged, boundRx)
       await assert.rejects(receiver.read(), /integrity check/)
       assert.equal(receiver.stats.outputBytes, 0)
     } finally {

@@ -4,6 +4,7 @@ import { encodeShards, splitCiphertext } from "../coding/reedsolomon.js"
 import {
   assertCode,
   assertShardSize,
+  CLOSE_NOTICE_MS,
   DEFAULT_IDLE_MS,
   DEFAULT_MAX_SENDS,
   DEFAULT_RETX_AFTER_MS,
@@ -21,8 +22,8 @@ import {
 import { assertSession, blockAad, deriveKeys, seal, sealedLength } from "../crypto/session.js"
 import { emptySenderStats, type SenderStats } from "../metrics.js"
 import { encodeEnvelope } from "../protocol/envelope.js"
-import { decodeFrame, encodeData } from "../protocol/frames.js"
-import { asError, Signal } from "../util.js"
+import { decodeClose, decodeFrame, encodeClose, encodeData, type CloseReason } from "../protocol/frames.js"
+import { asError, Signal, waitAtMost } from "../util.js"
 import { addressPerRelay, type PeerAddress } from "./address.js"
 import type { Probe } from "./probe.js"
 import { PathScheduler } from "./scheduler.js"
@@ -145,6 +146,8 @@ export class TeseraSender {
   private finished = false
   private stopped = false
   private closed = false
+  /** One shutdown, including the close notice. A second close waits for it. */
+  private closing: Promise<void> | null = null
   private error: Error | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
   private deadlineAt = 0
@@ -176,6 +179,10 @@ export class TeseraSender {
   private recoverFrom = 0
   /** Date.now() of the last block ACK, or of the send that started a busy period. */
   private lastAckAt = 0
+  /** A verified close from the receiver is already the error. Don't answer it with another close. */
+  private remoteClose = false
+  /** The one close this sender will send. Repeats and a finished transfer send nothing. */
+  private closeSent = false
 
   constructor(opts: SenderOptions) {
     assertSession(opts.session)
@@ -303,14 +310,30 @@ export class TeseraSender {
     this.onPeerFail?.(this.error)
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return
+  /**
+   * Stop, and when this transfer has not finished, send one close notice first.
+   * `cancel` is a choice to stop. `end` is a failure. A finished transfer sends nothing,
+   * so the notice cannot arrive after the last block and look like a cancel.
+   */
+  async close(reason?: CloseReason): Promise<void> {
+    if (this.closing) return this.closing
+    let done: () => void = () => {}
+    this.closing = new Promise<void>((resolve) => {
+      done = resolve
+    })
+    void this.shutdown(reason).finally(done)
+    return this.closing
+  }
+
+  private async shutdown(reason?: CloseReason): Promise<void> {
     this.closed = true
     this.stopped = true
     if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
     }
+    const complete = this.finished && this.inflight.size === 0 && !this.error
+    if (!complete && !this.remoteClose) await this.leave(reason ?? "end")
     if (!this.error && this.inflight.size > 0) {
       this.error = new Error("sender closed before completion")
     }
@@ -417,8 +440,46 @@ export class TeseraSender {
     if (this.inflight.size > 0) throw new Error("sender closed before completion")
   }
 
+  /** A receiver's close. A sender's own notice, a bad session, or a notice after the bytes are done does nothing. */
+  private takeClose(close: { sessionId: Buffer; reason: CloseReason; from: "sender" | "receiver" }): void {
+    if (close.from !== "receiver" || !close.sessionId.equals(this.id)) return
+    if (this.finished && this.inflight.size === 0) return
+    this.remoteClose = true
+    const message = close.reason === "cancel" ? "the receiver cancelled the transfer" : "the other person ended the transfer"
+    this.fail(new Error(message))
+  }
+
+  /**
+   * One notice to every relay, then stop. A lost notice leaves the idle timeout as the fallback.
+   * A send that can't be handed off within CLOSE_NOTICE_MS is abandoned, so close still finishes.
+   */
+  private async leave(reason: CloseReason): Promise<void> {
+    if (this.closeSent) return
+    this.closeSent = true
+    const transport = this.transport
+    if (!transport) return
+    const frame = encodeClose("sender", this.id, reason, this.macKey)
+    const sends = Promise.all(
+      this.relays.map(async (relay, index) => {
+        const receiver = this.receivers[index]
+        if (!receiver) return
+        try {
+          await transport.send(encodeEnvelope(receiver, frame), relay)
+        } catch {
+          // Best effort. The peer's idle timeout still ends a transfer whose notice never left.
+        }
+      }),
+    )
+    await waitAtMost(sends, CLOSE_NOTICE_MS)
+  }
+
   private async onMessage(msg: Buffer): Promise<void> {
     if (this.closed) return
+    const close = decodeClose(msg, this.macKey)
+    if (close) {
+      this.takeClose(close)
+      return
+    }
     const probe = this.probe
     const t0 = probe ? performance.now() : 0
     const frame = decodeFrame(msg, this.macKey)

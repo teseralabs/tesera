@@ -1,27 +1,63 @@
 import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { decodeShards, joinShards } from "../coding/reedsolomon.js"
 import {
+  assertCode,
+  CLOSE_NOTICE_MS,
   DEFAULT_ACK_GRACE_MS,
   DEFAULT_NACK_AFTER_MS,
   DEFAULT_TICK_MS,
   MAX_AHEAD,
   MAX_RETX_BACKOFF_MS,
 } from "../constants.js"
+import { crc32 } from "../protocol/crc32.js"
 import { assertSession, blockAad, deriveKeys, open } from "../crypto/session.js"
 import { emptyReceiverStats, type ReceiverStats } from "../metrics.js"
 import { encodeEnvelope } from "../protocol/envelope.js"
-import { decodeFrame, encodeAck, encodeNack, encodeSample, type DataFrame } from "../protocol/frames.js"
-import { asError, Signal, sleep } from "../util.js"
+import { decodeClose, decodeFrame, encodeAck, encodeClose, encodeNack, encodeSample, type CloseFrame, type CloseReason, type DataFrame } from "../protocol/frames.js"
+import { asError, Signal, sleep, waitAtMost } from "../util.js"
 import { addressPerRelay, type PeerAddress } from "./address.js"
 import type { Probe } from "./probe.js"
 
-type PartialBlock = {
+/**
+ * Parameter sets remembered for one block. A new set may replace one that can no longer open,
+ * or one with strictly fewer shards. Equal sets stay, so a fresh length cannot displace a set
+ * that is just as far along. Two different lengths can still fill both slots before the honest
+ * length is seen; telling those apart takes an authenticated header, which this protocol does not have.
+ */
+const MAX_GROUPS = 2
+/**
+ * Open attempts for one parameter set. A code with one spare tessera has at most n combinations,
+ * and n never exceeds 32, so those transfers try every combination. Denser codes stop here.
+ */
+const MAX_BLOCK_DECODES = 32
+
+type HeldShard = {
+  payload: Buffer
+  /** Relay that delivered this copy. The ACK goes back through one of the relays that opened the block. */
+  via: number
+  /** A suspect index accepts one different payload. Further different copies are ignored. */
+  replaced: boolean
+  /** This same payload arrived again after its index was part of a failed open. */
+  confirmed: boolean
+}
+
+type ShardGroup = {
   k: number
   n: number
   cipherLen: number
   shardLen: number
-  shards: Map<number, Buffer>
+  shards: Map<number, HeldShard>
+  /** Combinations already opened, keyed by index and payload checksum, so a replacement can be tried. */
+  rejected: Set<string>
+  suspect: Set<number>
+  decodes: number
+  born: number
+}
+
+type PartialBlock = {
+  groups: ShardGroup[]
   firstSeen: number
+  lastError: string
 }
 
 type ReadyBlock = {
@@ -51,6 +87,11 @@ export type ReceiverOptions = {
   maxUnreadBytes?: number
   /** Timing notes for diagnostics. */
   probe?: Probe
+  /**
+   * k and n taken from the offer. A frame that claims another code is dropped.
+   * Omitted means the first block that opens authenticates them.
+   */
+  coding?: { k: number; n: number }
 }
 
 export class TeseraReceiver {
@@ -92,12 +133,19 @@ export class TeseraReceiver {
   private sessionId: Buffer | null = null
   private k = 0
   private n = 0
+  private groupSeq = 0
   private nextDeliver = 0
   private highestSeen = -1
   private gapsFrom = 0
   private streamEnded = false
   private stopped = false
   private closed = false
+  /** One shutdown, including the close notice. A second close waits for it. */
+  private closing: Promise<void> | null = null
+  /** A verified close from the sender is already the error. Don't answer it with another close. */
+  private remoteClose = false
+  /** The one close this receiver will send. */
+  private closeSent = false
   private error: Error | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
 
@@ -114,6 +162,11 @@ export class TeseraReceiver {
     if (!(this.maxUnreadBytes > 0)) throw new Error("maxUnreadBytes must be > 0")
     this.openTransport = transportOrUdp(opts)
     this.probe = opts.probe ?? null
+    if (opts.coding) {
+      assertCode(opts.coding.k, opts.coding.n)
+      this.k = opts.coding.k
+      this.n = opts.coding.n
+    }
     if (opts.sessionId) this.adopt(Buffer.from(opts.sessionId))
   }
 
@@ -179,14 +232,29 @@ export class TeseraReceiver {
     this.onPeerFail?.(this.error)
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return
+  /**
+   * Stop, and when the stream has not finished, send one close notice first.
+   * A finished stream sends nothing, so a notice cannot race the last block.
+   */
+  async close(reason?: CloseReason): Promise<void> {
+    if (this.closing) return this.closing
+    let done: () => void = () => {}
+    this.closing = new Promise<void>((resolve) => {
+      done = resolve
+    })
+    void this.shutdown(reason).finally(done)
+    return this.closing
+  }
+
+  private async shutdown(reason?: CloseReason): Promise<void> {
     this.closed = true
     this.stopped = true
     if (this.timer) {
       clearTimeout(this.timer)
       this.timer = null
     }
+    const complete = this.streamEnded && !this.error
+    if (!complete && !this.remoteClose) await this.leave(reason ?? "end")
     if (!this.error && !this.streamEnded) this.error = new Error("receiver closed before completion")
     this.readWake.notify()
     const transport = this.transport
@@ -209,6 +277,11 @@ export class TeseraReceiver {
     // A data frame has no MAC and the first one picks the session id, so only relays may deliver.
     const via = this.relayIndex(remote)
     if (via < 0) return
+    const close = decodeClose(msg, this.macKeyFor(msg))
+    if (close) {
+      this.takeClose(close)
+      return
+    }
     const probe = this.probe
     const t0 = probe ? performance.now() : 0
     const frame = decodeFrame(msg, this.macKey)
@@ -227,54 +300,192 @@ export class TeseraReceiver {
       await this.ackOrHold(frame.blockId, via)
       return
     }
-    const first = this.noteArrival(frame.blockId, frame.tesseraIndex)
-    if (first) void this.sendSample(frame.blockId, frame.tesseraIndex, remote).catch(() => {})
-    this.acceptTessera(frame, via)
+    this.acceptTessera(frame, via, remote)
   }
 
-  private acceptTessera(frame: DataFrame, via: number): void {
-    if (this.k === 0) {
-      this.k = frame.k
-      this.n = frame.n
-    } else if (frame.k !== this.k || frame.n !== this.n) {
-      this.fail(new Error("tesserae disagree on k and n"))
-      return
-    }
+  /**
+   * Keep the frame when it can still help this block. A bad checksum never arrives here.
+   * A different k or n is dropped once one block has opened, or stored as its own set until then.
+   * Returns false when the frame was ignored or the block has just failed its integrity check.
+   */
+  private acceptTessera(frame: DataFrame, via: number, remote: Endpoint): boolean {
+    if (this.k !== 0 && (frame.k !== this.k || frame.n !== this.n)) return false
     let partial = this.partials.get(frame.blockId)
     if (!partial) {
-      partial = {
-        k: frame.k,
-        n: frame.n,
-        cipherLen: frame.cipherLen,
-        shardLen: frame.payload.length,
-        shards: new Map(),
-        firstSeen: Date.now(),
-      }
+      partial = { groups: [], firstSeen: Date.now(), lastError: "" }
       this.partials.set(frame.blockId, partial)
       this.missingSince.delete(frame.blockId)
       this.probe?.step(frame.blockId, "first", performance.now())
-    } else if (partial.cipherLen !== frame.cipherLen || partial.shardLen !== frame.payload.length) {
-      this.fail(new Error(`block ${frame.blockId} tesserae disagree on length`))
-      return
     }
-    if (!partial.shards.has(frame.tesseraIndex)) partial.shards.set(frame.tesseraIndex, frame.payload)
+    const group = this.place(partial, frame)
+    if (!group) {
+      if (partial.groups.length === 0) this.partials.delete(frame.blockId)
+      return false
+    }
+    if (!this.hold(group, frame, via)) return false
+    // The sample has to leave before the ACK. The sender learns the round trip from it, and only
+    // then stretches the resend timer. An ACK that arrives first opens the window on the old timer.
+    const first = this.noteArrival(frame.blockId, frame.tesseraIndex)
+    if (first) void this.sendSample(frame.blockId, frame.tesseraIndex, remote).catch(() => {})
     if (frame.blockId > this.highestSeen) this.highestSeen = frame.blockId
     this.noteGaps()
     this.noteBuffer()
-    if (partial.shards.size >= partial.k) {
+    if (group.shards.size >= group.k) {
       this.probe?.step(frame.blockId, "k", performance.now())
-      this.reconstruct(frame.blockId, partial, via)
+      this.recover(frame.blockId, partial, via)
+    }
+    return this.error === null
+  }
+
+  private place(partial: PartialBlock, frame: DataFrame): ShardGroup | null {
+    for (const group of partial.groups) {
+      if (
+        group.k === frame.k &&
+        group.n === frame.n &&
+        group.cipherLen === frame.cipherLen &&
+        group.shardLen === frame.payload.length
+      ) {
+        return group
+      }
+    }
+    const created = this.newGroup(frame)
+    if (partial.groups.length < MAX_GROUPS) {
+      partial.groups.push(created)
+      return created
+    }
+    const victim = this.evictionVictim(partial.groups)
+    if (!victim) return null
+    const at = partial.groups.indexOf(victim)
+    if (at < 0) return null
+    partial.groups[at] = created
+    return created
+  }
+
+  private newGroup(frame: DataFrame): ShardGroup {
+    return {
+      k: frame.k,
+      n: frame.n,
+      cipherLen: frame.cipherLen,
+      shardLen: frame.payload.length,
+      shards: new Map(),
+      rejected: new Set(),
+      suspect: new Set(),
+      decodes: 0,
+      born: this.groupSeq++,
     }
   }
 
-  private reconstruct(blockId: number, partial: PartialBlock, via: number): void {
-    if (this.done.has(blockId)) return
-    const parts = [...partial.shards.entries()].map(([index, data]) => ({ index, data }))
+  /**
+   * The first copy of an index stays until an open that used it fails. One different copy may
+   * then replace it. A repeat of a suspect copy confirms that those bytes are not a stand-in.
+   */
+  private hold(group: ShardGroup, frame: DataFrame, via: number): boolean {
+    const existing = group.shards.get(frame.tesseraIndex)
+    if (!existing) {
+      group.shards.set(frame.tesseraIndex, {
+        payload: Buffer.from(frame.payload),
+        via,
+        replaced: false,
+        confirmed: false,
+      })
+      return true
+    }
+    if (existing.payload.equals(frame.payload)) {
+      if (group.suspect.has(frame.tesseraIndex)) existing.confirmed = true
+      return true
+    }
+    if (!group.suspect.has(frame.tesseraIndex) || existing.replaced) return false
+    existing.payload = Buffer.from(frame.payload)
+    existing.via = via
+    existing.replaced = true
+    existing.confirmed = false
+    group.suspect.delete(frame.tesseraIndex)
+    return true
+  }
+
+  /**
+   * A set that has failed every open can be replaced. Otherwise only a strictly smaller set can,
+   * and the one with the most shards stays. A tie drops the new length instead of evicting either set.
+   */
+  private evictionVictim(groups: ShardGroup[]): ShardGroup | null {
+    const stuck = groups.filter((group) => !this.groupWaiting(group))
+    if (stuck.length > 0) return this.smallest(stuck)
+    let largest = 0
+    for (const group of groups) if (group.shards.size > largest) largest = group.shards.size
+    return this.smallest(groups.filter((group) => group.shards.size < largest))
+  }
+
+  private smallest(groups: ShardGroup[]): ShardGroup | null {
+    let victim: ShardGroup | null = null
+    for (const group of groups) {
+      if (!victim || group.shards.size < victim.shards.size || (group.shards.size === victim.shards.size && group.born < victim.born)) {
+        victim = group
+      }
+    }
+    return victim
+  }
+
+  private recover(blockId: number, partial: PartialBlock, via: number): void {
+    if (this.done.has(blockId) || this.error) return
+    for (const group of partial.groups) {
+      if (group.shards.size < group.k) continue
+      if (this.tryGroup(blockId, partial, group, via)) return
+    }
+    if (partial.groups.length === 0 || partial.groups.some((group) => this.groupWaiting(group))) return
+    const why = partial.lastError || "no consistent tesserae"
+    this.fail(new Error(`block ${blockId} failed integrity check: ${why}`))
+  }
+
+  /**
+   * Still collecting, still holding an untried combination, or still waiting for one replacement
+   * or a repeat of a suspect tessera. A full set whose every combination failed, and whose suspect
+   * tesserae were either replaced or seen again, is not waiting.
+   */
+  private groupWaiting(group: ShardGroup): boolean {
+    if (group.decodes >= MAX_BLOCK_DECODES) return false
+    if (group.shards.size < group.k) return true
+    if (this.untriedCombo(group)) return true
+    if (group.shards.size < group.n) return true
+    for (const [index, shard] of group.shards) {
+      if (group.suspect.has(index) && !shard.replaced && !shard.confirmed) return true
+    }
+    return false
+  }
+
+  private tryGroup(blockId: number, partial: PartialBlock, group: ShardGroup, via: number): boolean {
+    while (group.decodes < MAX_BLOCK_DECODES) {
+      const combo = this.untriedCombo(group)
+      if (!combo) return false
+      if (this.openCombo(blockId, partial, group, combo, via)) return true
+    }
+    return false
+  }
+
+  /**
+   * Exactly these k shards. Passing the whole set would keep a corrupt systematic shard and
+   * ignore a good spare, because the decoder returns indices 0..k-1 whenever it has them.
+   */
+  private openCombo(
+    blockId: number,
+    partial: PartialBlock,
+    group: ShardGroup,
+    combo: readonly number[],
+    via: number,
+  ): boolean {
+    const key = this.comboKey(group, combo)
+    group.rejected.add(key)
+    group.decodes++
+    const parts: Array<{ index: number; data: Buffer }> = []
+    for (const index of combo) {
+      const shard = group.shards.get(index)
+      if (!shard) return false
+      parts.push({ index, data: shard.payload })
+    }
     let opened: { fin: boolean; body: Buffer; sentAtMs: number }
+    const t0 = performance.now()
     try {
-      const t0 = performance.now()
-      const dataShards = decodeShards(parts, partial.k, partial.n)
-      const cipher = joinShards(dataShards, partial.cipherLen)
+      const dataShards = decodeShards(parts, group.k, group.n)
+      const cipher = joinShards(dataShards, group.cipherLen)
       this.stats.decodeMs += performance.now() - t0
       const t1 = performance.now()
       if (!this.aeadKey || !this.sessionId) throw new Error("missing traffic keys")
@@ -285,10 +496,10 @@ export class TeseraReceiver {
         blockAad({
           sessionId: this.sessionId,
           blockId,
-          k: partial.k,
-          n: partial.n,
-          cipherLen: partial.cipherLen,
-          shardLen: partial.shardLen,
+          k: group.k,
+          n: group.n,
+          cipherLen: group.cipherLen,
+          shardLen: group.shardLen,
         }),
       )
       this.stats.decryptMs += performance.now() - t1
@@ -298,9 +509,12 @@ export class TeseraReceiver {
         this.probe.note("receiver.resident", this.partials.size + this.ready.size)
       }
     } catch (err) {
-      this.fail(new Error(`block ${blockId} failed integrity check: ${asError(err).message}`))
-      return
+      if (asError(err).message === "missing traffic keys") throw err
+      partial.lastError = asError(err).message
+      for (const index of combo) group.suspect.add(index)
+      return false
     }
+    this.pinFrom(group.k, group.n)
     this.partials.delete(blockId)
     this.done.add(blockId)
     this.decoded.add(blockId)
@@ -309,7 +523,83 @@ export class TeseraReceiver {
     const latencyMs = Math.max(0, Date.now() - opened.sentAtMs)
     this.ready.set(blockId, { body: opened.body, fin: opened.fin, latencyMs })
     this.drain()
-    void this.ackOrHold(blockId, via).catch((err) => this.fail(err))
+    void this.ackOrHold(blockId, this.ackVia(group, combo, via)).catch((err) => this.fail(err))
+    return true
+  }
+
+  private ackVia(group: ShardGroup, combo: readonly number[], fallback: number): number {
+    for (const index of combo) {
+      const shard = group.shards.get(index)
+      if (shard) return shard.via
+    }
+    return fallback
+  }
+
+  /**
+   * The opened block authenticated k and n. Later frames that claim another code are dropped.
+   * Once pinned, no set with another code is ever stored, so only the first pin has anything to prune.
+   */
+  private pinFrom(k: number, n: number): void {
+    if (this.k !== 0) return
+    this.k = k
+    this.n = n
+    for (const [id, partial] of [...this.partials]) {
+      partial.groups = partial.groups.filter((group) => group.k === this.k && group.n === this.n)
+      if (partial.groups.length === 0) this.partials.delete(id)
+    }
+  }
+
+  /** Non-suspect indices first, so the next attempt leaves out a tessera that already failed. */
+  private orderedIndices(group: ShardGroup): number[] {
+    return [...group.shards.keys()].sort((a, b) => {
+      const aSuspect = group.suspect.has(a) ? 1 : 0
+      const bSuspect = group.suspect.has(b) ? 1 : 0
+      if (aSuspect !== bSuspect) return aSuspect - bSuspect
+      return a - b
+    })
+  }
+
+  private untriedCombo(group: ShardGroup): number[] | null {
+    const universe = this.orderedIndices(group)
+    if (universe.length < group.k) return null
+    let combo = universe.slice(0, group.k)
+    for (let step = 0; step < MAX_BLOCK_DECODES; step++) {
+      if (!group.rejected.has(this.comboKey(group, combo))) return combo
+      const next = this.nextCombo(combo, universe)
+      if (!next) return null
+      combo = next
+    }
+    return null
+  }
+
+  private nextCombo(combo: readonly number[], universe: readonly number[]): number[] | null {
+    const k = combo.length
+    const next = combo.slice()
+    for (let i = k - 1; i >= 0; i--) {
+      const current = next[i]
+      if (current === undefined) return null
+      const pos = universe.indexOf(current)
+      if (pos < 0) return null
+      if (pos < universe.length - k + i) {
+        for (let j = i; j < k; j++) {
+          const value = universe[pos + 1 + (j - i)]
+          if (value === undefined) return null
+          next[j] = value
+        }
+        return next
+      }
+    }
+    return null
+  }
+
+  private comboKey(group: ShardGroup, combo: readonly number[]): string {
+    const ordered = [...combo].sort((a, b) => a - b)
+    let key = ""
+    for (const index of ordered) {
+      const shard = group.shards.get(index)
+      key += `${index}:${shard ? crc32(shard.payload) : 0},`
+    }
+    return key
   }
 
   /** `via` is the relay that brought the tessera being answered. Its path just worked, so the ACK goes back on it. */
@@ -429,18 +719,47 @@ export class TeseraReceiver {
     if (size > this.stats.maxBufferedBlocks) this.stats.maxBufferedBlocks = size
   }
 
+  private knownN(): number {
+    if (this.n > 0) return this.n
+    for (const partial of this.partials.values()) {
+      const group = partial.groups[0]
+      if (group) return group.n
+    }
+    return 0
+  }
+
+  /** The parameter set with the most shards is the one a repair can still finish. */
+  private focusGroup(partial: PartialBlock): ShardGroup | null {
+    let best: ShardGroup | null = null
+    for (const group of partial.groups) {
+      if (this.k !== 0 && (group.k !== this.k || group.n !== this.n)) continue
+      if (!best || group.shards.size > best.shards.size) best = group
+    }
+    return best ?? partial.groups[0] ?? null
+  }
+
+  /** Indices the sender should send again: ones we lack, and suspect ones not yet confirmed. */
+  private wanted(group: ShardGroup): number[] {
+    const missing: number[] = []
+    for (let index = 0; index < group.n; index++) {
+      const shard = group.shards.get(index)
+      if (!shard || (group.suspect.has(index) && !shard.confirmed)) missing.push(index)
+    }
+    return missing
+  }
+
   private async nackTick(): Promise<void> {
-    if (this.stopped || !this.senders || this.n === 0) return
+    const n = this.knownN()
+    if (this.stopped || !this.senders || n === 0) return
     const now = Date.now()
     for (const id of this.nackPace.keys()) {
       if (!this.partials.has(id) && !this.missingSince.has(id)) this.nackPace.delete(id)
     }
     for (const [id, partial] of this.partials) {
       if (now - partial.firstSeen < this.nackAfterMs || !this.nackDue(id, now)) continue
-      const missing: number[] = []
-      for (let index = 0; index < partial.n; index++) {
-        if (!partial.shards.has(index)) missing.push(index)
-      }
+      const group = this.focusGroup(partial)
+      if (!group) continue
+      const missing = this.wanted(group)
       if (missing.length > 0) await this.sendNack(id, missing)
     }
     for (const [id, since] of [...this.missingSince.entries()]) {
@@ -448,9 +767,9 @@ export class TeseraReceiver {
         this.missingSince.delete(id)
         continue
       }
-      if (now - since < this.nackAfterMs || this.n === 0 || !this.nackDue(id, now)) continue
+      if (now - since < this.nackAfterMs || !this.nackDue(id, now)) continue
       const missing: number[] = []
-      for (let index = 0; index < this.n; index++) missing.push(index)
+      for (let index = 0; index < n; index++) missing.push(index)
       await this.sendNack(id, missing)
     }
   }
@@ -466,6 +785,53 @@ export class TeseraReceiver {
     const waitMs = pace ? Math.min(MAX_RETX_BACKOFF_MS, pace.waitMs * 2) : this.nackAfterMs
     this.nackPace.set(id, { nextAt: now + waitMs, waitMs })
     return true
+  }
+
+  /** A sender's close. A receiver's own notice, another session, or a notice after the stream ends does nothing. */
+  private takeClose(close: CloseFrame): void {
+    if (close.from !== "sender") return
+    if (this.sessionId && !this.sessionId.equals(close.sessionId)) return
+    if (this.streamEnded) return
+    if (!this.sessionId && !this.adopt(close.sessionId)) return
+    this.remoteClose = true
+    const message = close.reason === "cancel" ? "the sender cancelled the transfer" : "the other person ended the transfer"
+    this.fail(new Error(message))
+  }
+
+  /** The adopted control key, or the key for the session id in an early notice. */
+  private macKeyFor(msg: Buffer): Uint8Array | null {
+    if (this.macKey) return this.macKey
+    if (msg.length < 2 + 16) return null
+    try {
+      return deriveKeys(this.secret, msg.subarray(2, 2 + 16)).macKey
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * One notice to every relay, then stop. A lost notice leaves the idle timeout as the fallback.
+   * A send that can't be handed off within CLOSE_NOTICE_MS is abandoned, so close still finishes.
+   */
+  private async leave(reason: CloseReason): Promise<void> {
+    if (this.closeSent || !this.sessionId || !this.macKey) return
+    this.closeSent = true
+    const transport = this.transport
+    const senders = this.senders
+    if (!transport || !senders) return
+    const frame = encodeClose("receiver", this.sessionId, reason, this.macKey)
+    const sends = Promise.all(
+      this.relays.map(async (relay, index) => {
+        const sender = senders[index]
+        if (!sender) return
+        try {
+          await transport.send(encodeEnvelope(sender, frame), relay)
+        } catch {
+          // Best effort. The peer's idle timeout still ends a transfer whose notice never left.
+        }
+      }),
+    )
+    await waitAtMost(sends, CLOSE_NOTICE_MS)
   }
 
   private async sendSample(blockId: number, tesseraIndex: number, remote: Endpoint): Promise<void> {

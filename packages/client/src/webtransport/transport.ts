@@ -186,10 +186,10 @@ async function attach(
   })()
   wt.closed.then(
     () => {
-      if (!closing) events.error(new TeseraError("connection", "the relay closed the attachment"))
+      if (!closing) events.error(new TeseraError("connection", "the relay closed the attachment", { reason: "closed" }))
     },
     (err) => {
-      if (!closing) events.error(new TeseraError("connection", "the attachment to the relay failed", { cause: err }))
+      if (!closing) events.error(new TeseraError("connection", "the attachment to the relay failed", { cause: err, reason: "closed" }))
     },
   )
 
@@ -197,7 +197,7 @@ async function attach(
     endpoint,
     maxPacketSize: maxDatagram - FRAME_HEADER_LEN,
     async send(packet, to) {
-      if (closing) throw new TeseraError("connection", "the attachment is closed")
+      if (closing) throw new TeseraError("connection", "the attachment is closed", { reason: "closed" })
       if (FRAME_HEADER_LEN + packet.length > maxDatagram) {
         throw new TeseraError("transfer", `a ${packet.length}-byte datagram does not fit this attachment's ${maxDatagram - FRAME_HEADER_LEN}`)
       }
@@ -212,7 +212,7 @@ async function attach(
       await writer.write(frame)
     },
     async claimSession(sessionId) {
-      if (closing) throw new TeseraError("connection", "the attachment is closed")
+      if (closing) throw new TeseraError("connection", "the attachment is closed", { reason: "closed" })
       const reply = decodeControl(await within(control(wt, encodeControl(CLAIM, sessionId)), timeoutMs, undefined, url))
       const status = reply?.kind === CLAIM ? reply.body[0] : undefined
       if (status === CLAIM_OK) return
