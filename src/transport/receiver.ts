@@ -527,12 +527,20 @@ export class TeseraReceiver {
     return true
   }
 
-  private ackVia(group: ShardGroup, combo: readonly number[], fallback: number): number {
+  /**
+   * The relay that brought the tessera which just opened the block, as before recovery existed:
+   * its path just worked. Only when that tessera was not part of the opening set, such as a
+   * suspect copy, does the ACK go back through a relay whose tessera did open it.
+   */
+  private ackVia(group: ShardGroup, combo: readonly number[], latest: number): number {
+    let other = -1
     for (const index of combo) {
       const shard = group.shards.get(index)
-      if (shard) return shard.via
+      if (!shard) continue
+      if (shard.via === latest) return latest
+      if (other < 0) other = shard.via
     }
-    return fallback
+    return other < 0 ? latest : other
   }
 
   /**
