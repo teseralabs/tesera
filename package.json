@@ -1,6 +1,6 @@
 {
   "name": "tesera",
-  "version": "0.3.2-beta",
+  "version": "0.3.3-beta",
   "license": "Apache-2.0",
   "private": true,
   "type": "module",
