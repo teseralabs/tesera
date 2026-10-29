@@ -22,6 +22,8 @@ export const MAX_RETX_BACKOFF_MS = 2_000
 export const MIN_WINDOW = 4
 /** The sender gives up when no block has been acknowledged for this long. */
 export const DEFAULT_IDLE_MS = 60_000
+/** Longest a close waits for its notice to be handed to the transport. A full send queue must not hold up the shutdown. */
+export const CLOSE_NOTICE_MS = 1_000
 /** How long a receiver keeps acknowledging repeats after the stream ends. */
 export const DEFAULT_ACK_GRACE_MS = 2_000
 export const DEFAULT_TICK_MS = 20

@@ -73,6 +73,27 @@ export type SampleFrame = {
 
 export type Frame = DataFrame | AckFrame | NackFrame | SampleFrame
 
+/**
+ * Block id of a close notice. It is not a block a sender will transmit: the notice is a
+ * control record carried in a data or ack type so relays already deployed will route it.
+ */
+export const CLOSE_BLOCK = 0xffffffff
+/** The peer chose to stop. The other end can say who cancelled. */
+export const CLOSE_CANCEL = 1
+/** The peer is stopping because it failed. The notice carries no reason text. */
+export const CLOSE_END = 2
+
+export type CloseReason = "cancel" | "end"
+export type CloseFrom = "sender" | "receiver"
+
+export type CloseFrame = {
+  kind: "close"
+  sessionId: Buffer
+  reason: CloseReason
+  /** Which peer minted it. Relays deliver a data type to the receiver and an ack type to the sender. */
+  from: CloseFrom
+}
+
 function sessionAt(packet: Buffer): Buffer {
   return Buffer.from(packet.subarray(2, 2 + SESSION_ID_LEN))
 }
@@ -114,6 +135,38 @@ export function encodeSample(frame: SampleFrame, key: Uint8Array): Buffer {
     throw new Error("bad tessera index")
   }
   return finishControl(FRAME_SAMPLE, frame.sessionId, frame.blockId, Buffer.from([frame.tesseraIndex]), key)
+}
+
+/**
+ * One authenticated notice that this peer is stopping. A sender's notice uses the data type and a
+ * receiver's uses the ack type, which is how an attachment relay already decides who may send it
+ * and who receives it. The body is a single reason byte. An older decoder rejects the shape: the
+ * data record's checksum does not match, and the ack record is one byte longer than an ack.
+ */
+export function encodeClose(from: CloseFrom, sessionId: Buffer, reason: CloseReason, key: Uint8Array): Buffer {
+  const type = from === "sender" ? FRAME_DATA : FRAME_ACK
+  const body = Buffer.from([reason === "cancel" ? CLOSE_CANCEL : CLOSE_END])
+  return finishControl(type, sessionId, CLOSE_BLOCK, body, key)
+}
+
+/** A verified close notice, or null when the bytes are not one. A bad MAC is null, not a failure. */
+export function decodeClose(buf: Uint8Array, macKey: Uint8Array | null): CloseFrame | null {
+  if (!macKey) return null
+  const packet = Buffer.from(buf)
+  if (packet.length !== 22 + 1 + MAC_LEN || packet[0] !== PROTOCOL_VERSION) return null
+  const type = packet[1]
+  if (type !== FRAME_DATA && type !== FRAME_ACK) return null
+  const unsigned = packet.subarray(0, packet.length - MAC_LEN)
+  if (!macMatches(macKey, unsigned, packet.subarray(packet.length - MAC_LEN))) return null
+  if (packet.readUInt32BE(18) !== CLOSE_BLOCK) return null
+  const reasonByte = packet[22]
+  if (reasonByte !== CLOSE_CANCEL && reasonByte !== CLOSE_END) return null
+  return {
+    kind: "close",
+    sessionId: sessionAt(packet),
+    reason: reasonByte === CLOSE_CANCEL ? "cancel" : "end",
+    from: type === FRAME_DATA ? "sender" : "receiver",
+  }
 }
 
 function finishControl(

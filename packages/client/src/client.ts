@@ -1,6 +1,6 @@
 import { randomBytes, TeseraReceiver, TeseraSender, type OpenTransport, type TransportEvents as CoreEvents } from "./core.js"
 import type { Probe } from "./probe.js"
-import { asTeseraError, TeseraError } from "./errors.js"
+import { asTeseraError, reportedFailure, TeseraError } from "./errors.js"
 import { streamHash } from "./hash.js"
 import {
   code,
@@ -166,6 +166,7 @@ export class TeseraClient {
         sender: offer.sender,
         transport: wire.open(connection),
         maxUnreadBytes: maxBuffered,
+        coding: { k: offer.k, n: offer.n },
         ...(this.probe ? { probe: this.probe } : {}),
       })
       await receiver.start()
@@ -243,7 +244,7 @@ export class OutgoingTransfer {
     this.started = true
     void this.run(answer).then(
       (result) => this.finish(null, result),
-      (err) => this.finish(this.cancelled ? cancelledError() : err),
+      (err) => this.finish(err),
     )
     return this.done
   }
@@ -253,7 +254,7 @@ export class OutgoingTransfer {
     if (this.finished || this.cancelled) return
     this.cancelled = true
     void this.reader.cancel()
-    void this.sender.close()
+    void this.sender.close("cancel")
     if (!this.started) this.finish(cancelledError())
   }
 
@@ -266,7 +267,14 @@ export class OutgoingTransfer {
     }
   }
 
-  private readonly onAbort = () => this.cancel()
+  private readonly onAbort = () => {
+    const reason = this.signal?.reason
+    if (reason instanceof TeseraError && reason.code !== "cancelled") {
+      this.sender.fail(reason)
+      return
+    }
+    this.cancel()
+  }
 
   private async run(answer: TransferAnswer): Promise<TransferResult> {
     const parsed = parseAnswer(answer)
@@ -303,13 +311,14 @@ export class OutgoingTransfer {
     return { bytes: this.bytes, ...(this.hash ? { sha256: this.hash.hex() } : {}) }
   }
 
-  private finish(err: TeseraError | null, result?: TransferResult): void {
+  private finish(err: unknown | null, result?: TransferResult): void {
     if (this.finished) return
     this.finished = true
     this.signal?.removeEventListener("abort", this.onAbort)
     if (err) void this.reader.cancel()
-    void this.sender.close().finally(() => this.connection.close().catch(() => {}))
-    if (err) this.settle.reject(err)
+    const why = err ? (this.cancelled ? "cancel" : "end") : undefined
+    void this.sender.close(why).finally(() => this.connection.close().catch(() => {}))
+    if (err) this.settle.reject(reportedFailure(err, this.cancelled))
     else if (result) this.settle.resolve(result)
   }
 }
@@ -362,8 +371,9 @@ export class IncomingTransfer {
         return result
       },
       (err) => {
-        this.cleanup(true)
-        throw this.cancelled ? cancelledError() : asTeseraError(err, "transfer")
+        const reported = reportedFailure(err, this.cancelled)
+        this.cleanup(true, reported)
+        throw reported
       },
     )
     this.done.catch(() => {})
@@ -373,7 +383,7 @@ export class IncomingTransfer {
   cancel(): void {
     if (this.finished || this.cancelled) return
     this.cancelled = true
-    void this.receiver.close()
+    void this.receiver.close("cancel")
   }
 
   /** Unstable numbers for diagnostics and tests. */
@@ -381,7 +391,14 @@ export class IncomingTransfer {
     return { ...this.receiver.stats, maxPacketSize: this.connection.maxPacketSize }
   }
 
-  private readonly onAbort = () => this.cancel()
+  private readonly onAbort = () => {
+    const reason = this.signal?.reason
+    if (reason instanceof TeseraError && reason.code !== "cancelled") {
+      this.receiver.fail(reason)
+      return
+    }
+    this.cancel()
+  }
 
   private async run(): Promise<TransferResult> {
     this.watch()
@@ -452,19 +469,19 @@ export class IncomingTransfer {
         seen = now
         at = Date.now()
       } else if (seen > 0 && Date.now() - at > this.idleMs) {
-        this.receiver.fail(new TeseraError("transfer", `no progress for ${Math.round(this.idleMs / 1000)} s`))
+        this.receiver.fail(new TeseraError("transfer", `no progress for ${Math.round(this.idleMs / 1000)} s`, { reason: "idle" }))
       }
     }, Math.min(1000, this.idleMs))
   }
 
-  private cleanup(failed: boolean): void {
+  private cleanup(failed: boolean, err?: TeseraError): void {
     if (this.finished) return
     this.finished = true
     this.signal?.removeEventListener("abort", this.onAbort)
     if (this.watchdog) clearInterval(this.watchdog)
     if (failed) {
-      void this.sink.abort(this.cancelled ? cancelledError() : new TeseraError("transfer", "the transfer failed")).catch(() => {})
-      void this.receiver.close().finally(() => this.connection.close().catch(() => {}))
+      void this.sink.abort(err ?? reportedFailure(new Error("the transfer failed"), false)).catch(() => {})
+      void this.receiver.close(this.cancelled ? "cancel" : "end").finally(() => this.connection.close().catch(() => {}))
       return
     }
     // Keep answering briefly: the sender may still be waiting for an acknowledgement that was lost.

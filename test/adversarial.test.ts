@@ -324,8 +324,12 @@ describe("receiver state", () => {
       failed = true
     }
     try {
-      await sendUdp(tx, shardFrame(sessionId, blockId, 1, k, n, cipherLen, shards[0] ?? Buffer.alloc(0)), boundRx)
-      await sendUdp(tx, shardFrame(sessionId, blockId, 0, k, n, cipherLen, shards[1] ?? Buffer.alloc(0)), boundRx)
+      const frames = [
+        shardFrame(sessionId, blockId, 1, k, n, cipherLen, shards[0] ?? Buffer.alloc(0)),
+        shardFrame(sessionId, blockId, 0, k, n, cipherLen, shards[1] ?? Buffer.alloc(0)),
+      ]
+      for (const frame of frames) await sendUdp(tx, frame, boundRx)
+      for (const frame of frames) await sendUdp(tx, frame, boundRx)
       await waitFor(() => failed || receiver.stats.outputBytes > 0)
       assert.equal(receiver.stats.outputBytes, 0)
       assert.equal(failed, true)

@@ -20,6 +20,19 @@ export function sleep(ms: number): Promise<void> {
   })
 }
 
+/** Wait for `work`, but no longer than `ms`. The timer is cleared either way, so it never holds a process open. */
+export async function waitAtMost(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const limit = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms)
+  })
+  try {
+    await Promise.race([work.then(() => {}, () => {}), limit])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export function asError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err))
 }
