@@ -1,4 +1,4 @@
-import { randomBytes, TeseraReceiver, TeseraSender, type OpenTransport, type TransportEvents as CoreEvents } from "./core.js"
+import { answerCheck, answerMac, answerMacMatches, answerProof, randomBytes, TeseraReceiver, TeseraSender, type OpenTransport, type TransportEvents as CoreEvents } from "./core.js"
 import type { Probe } from "./probe.js"
 import { asTeseraError, reportedFailure, TeseraError } from "./errors.js"
 import { streamHash } from "./hash.js"
@@ -153,6 +153,7 @@ export class TeseraClient {
       n,
       ...(size === undefined ? {} : { size }),
       sampleEvery: SAMPLE_EVERY,
+      answerCheck: toHex(answerCheck(answerProof(secret, sender.sessionId))),
     }
     return new OutgoingTransfer(offer, secretHex(secret), sender, connection, wire, reader, opts, this.probe)
   }
@@ -190,12 +191,17 @@ export class TeseraClient {
       await connection.close().catch(() => {})
       throw asTeseraError(err, "connection")
     }
-    const answer: TransferAnswer = {
+    const fields = {
       v: OFFER_VERSION,
       sessionId: offer.sessionId,
       receiver: { ...connection.endpoint },
       maxPacketSize: connection.maxPacketSize,
       ahead: receiver.ahead,
+    } as const
+    const answer: TransferAnswer = {
+      ...fields,
+      proof: toHex(answerProof(secret, sessionId)),
+      mac: toHex(answerMac(secret, sessionId, fields)),
     }
     return new IncomingTransfer(answer, offer, receiver, connection, sink, opts, this.probe)
   }
@@ -295,6 +301,14 @@ export class OutgoingTransfer {
   private async run(answer: TransferAnswer): Promise<TransferResult> {
     const parsed = parseAnswer(answer)
     if (parsed.sessionId !== this.offer.sessionId) throw new TeseraError("invalid", "the answer is for another transfer")
+    // An offer with a check came from this client, and its receiver signs the answer. A forged answer
+    // would send the transfer's tesserae somewhere the receiver isn't, so it is refused.
+    if (this.offer.answerCheck !== undefined) {
+      const sessionId = Buffer.from(parsed.sessionId, "hex")
+      if (!answerMacMatches(Buffer.from(this.secret, "hex"), sessionId, parsed, parsed.mac)) {
+        throw new TeseraError("invalid", "the answer was not made with this transfer's secret", { reason: "unauthenticated" })
+      }
+    }
     this.sender.setReceiver(parsed.receiver, parsed.maxPacketSize, parsed.ahead)
     await this.sender.start().catch((err) => {
       throw asTeseraError(err, "connection")

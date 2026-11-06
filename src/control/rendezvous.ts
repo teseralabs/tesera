@@ -4,6 +4,7 @@
 // Rooms live in memory. A restart forgets every room, and an endpoint that loses its room starts again.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { ANSWER_HEX, proofMatches } from "../crypto/answer.js"
 
 /** 128 random bits each, base64url without padding: 22 characters. */
 export const ROOM_BYTES = 16
@@ -43,6 +44,8 @@ export type CreatedRoom = { room: string; token: string; expiresAt: number }
 type Room = {
   tokenHash: Buffer
   sessionId: string
+  /** From the offer. When set, only an answer whose proof matches it is taken. */
+  answerCheck: string | null
   offer: string
   answer: string | null
   expiresAt: number
@@ -80,13 +83,23 @@ export class Rendezvous {
   /** Open a room for an offer. The token proves the sender in later calls; only its hash is kept. */
   create(text: string): CreatedRoom {
     this.sweep()
-    const sessionId = this.document(text)
+    const { sessionId, fields } = this.parse(text)
+    const check = fields["answerCheck"]
+    if (check !== undefined && (typeof check !== "string" || !ANSWER_HEX.test(check))) throw new RendezvousError(400, "document")
     if (this.rooms.size >= this.limits.maxRooms) throw new RendezvousError(503, "busy")
     let room = this.random(ROOM_BYTES).toString("base64url")
     while (this.rooms.has(room)) room = this.random(ROOM_BYTES).toString("base64url")
     const token = this.random(TOKEN_BYTES).toString("base64url")
     const expiresAt = this.now() + this.limits.ttlMs
-    this.rooms.set(room, { tokenHash: hashToken(token), sessionId, offer: text, answer: null, expiresAt, waiters: new Set() })
+    this.rooms.set(room, {
+      tokenHash: hashToken(token),
+      sessionId,
+      answerCheck: typeof check === "string" ? check : null,
+      offer: text,
+      answer: null,
+      expiresAt,
+      waiters: new Set(),
+    })
     return { room, token, expiresAt }
   }
 
@@ -100,10 +113,13 @@ export class Rendezvous {
   /**
    * Leave an answer. The first one wins. The same answer again is accepted, so a receiver that lost
    * the reply can retry; a different one is refused. An answer for another session id is refused too.
+   * When the offer carried an answer check, an answer without the matching proof is refused before
+   * it can take the slot, so knowing the room is not enough to answer it.
    */
   answer(room: string, text: string): void {
     const found = this.find(room)
-    const sessionId = this.document(text)
+    const { sessionId, fields } = this.parse(text)
+    if (found.answerCheck !== null && !proofMatches(found.answerCheck, fields["proof"])) throw new RendezvousError(403, "proof")
     if (found.answer !== null) {
       if (found.answer === text) return
       throw new RendezvousError(409, "answered")
@@ -181,8 +197,8 @@ export class Rendezvous {
     found.waiters.clear()
   }
 
-  /** The session id of a well-formed document, or a refusal. */
-  private document(text: string): string {
+  /** The session id and fields of a well-formed document, or a refusal. */
+  private parse(text: string): { sessionId: string; fields: Record<string, unknown> } {
     if (Buffer.byteLength(text, "utf8") > this.limits.maxDocumentBytes) throw new RendezvousError(413, "size")
     let parsed: unknown
     try {
@@ -194,7 +210,7 @@ export class Rendezvous {
     const { v, sessionId } = parsed as Record<string, unknown>
     if (!Number.isInteger(v) || (v as number) < 1) throw new RendezvousError(400, "document")
     if (typeof sessionId !== "string" || !/^[0-9a-f]{32}$/.test(sessionId)) throw new RendezvousError(400, "document")
-    return sessionId
+    return { sessionId, fields: parsed as Record<string, unknown> }
   }
 }
 

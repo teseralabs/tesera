@@ -6,6 +6,7 @@ import { memorySink, TeseraClient, TeseraError, type ClientTransport, type Progr
 import { reportedFailure } from "../src/errors.js"
 import { CRC_LEN, DATA_HEADER_LEN, DEFAULT_WINDOW, FRAME_DATA, PROTOCOL_VERSION } from "../../../src/constants.js"
 import { crc32 } from "../../../src/protocol/crc32.js"
+import { proofMatches } from "../../../src/crypto/answer.js"
 import { CHUNK_BYTES } from "../src/source.js"
 import { memoryWorld, type MemoryWorld } from "./memory-transport.js"
 
@@ -534,6 +535,39 @@ describe("errors", () => {
       )
       await rejectsWith(client.send(randomBytes(10), { relays: [] }), "invalid")
       await rejectsWith(client.send(randomBytes(10), { relays: world.relays.map((r) => r.endpoint), coding: { k: 3, n: 2 } }), "invalid")
+    })
+  })
+
+  it("refuses an answer not made with the transfer's secret", async () => {
+    await withWorld(async (world) => {
+      const { outgoing, incoming } = await pair(world, randomBytes(10))
+      const real = incoming.answer
+      const { mac: _mac, ...unsigned } = real
+      const forged = { ...real, mac: "00".repeat(32) }
+      const moved = { ...real, receiver: { ...real.receiver, port: real.receiver.port + 1 } }
+      for (const answer of [unsigned, forged, moved]) {
+        const other = await pair(world, randomBytes(10))
+        await assert.rejects(other.outgoing.start({ ...answer, sessionId: other.outgoing.offer.sessionId }), (err: unknown) => {
+          assert.ok(err instanceof TeseraError)
+          assert.equal(err.code, "invalid")
+          assert.equal(err.reason, "unauthenticated")
+          return true
+        })
+        other.incoming.cancel()
+      }
+      await assert.rejects(outgoing.start(moved), (err: unknown) => err instanceof TeseraError && err.reason === "unauthenticated")
+      incoming.cancel()
+    })
+  })
+
+  it("carries a check in the offer that the receiver's proof matches", async () => {
+    await withWorld(async (world) => {
+      const { outgoing, incoming } = await pair(world, randomBytes(10))
+      assert.match(outgoing.offer.answerCheck ?? "", /^[0-9a-f]{64}$/)
+      assert.ok(proofMatches(outgoing.offer.answerCheck ?? "", incoming.answer.proof))
+      assert.match(incoming.answer.mac ?? "", /^[0-9a-f]{64}$/)
+      const [sent] = await Promise.all([outgoing.start(incoming.answer), incoming.done])
+      assert.equal(sent.bytes, 10)
     })
   })
 

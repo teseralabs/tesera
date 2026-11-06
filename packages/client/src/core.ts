@@ -22,3 +22,4 @@ export {
 } from "../../../src/attach/framing.js"
 export { assertCode, MAX_N, MAX_SAMPLE_EVERY, SESSION_ID_LEN } from "../../../src/constants.js"
 export { randomBytes } from "../../../src/crypto/primitives.js"
+export { ANSWER_HEX, answerCheck, answerMac, answerMacMatches, answerProof } from "../../../src/crypto/answer.js"

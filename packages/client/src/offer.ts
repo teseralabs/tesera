@@ -1,4 +1,4 @@
-import { assertCode, MAX_N, MAX_SAMPLE_EVERY, SESSION_ID_LEN } from "./core.js"
+import { ANSWER_HEX, assertCode, MAX_N, MAX_SAMPLE_EVERY, SESSION_ID_LEN } from "./core.js"
 import { TeseraError } from "./errors.js"
 import type { Endpoint } from "./transport.js"
 
@@ -28,6 +28,12 @@ export type TransferOffer = {
    * field ignores it and samples every block, which a sender handles.
    */
   sampleEvery?: number
+  /**
+   * 32 bytes, hex: a one-way value from the secret. A control plane takes only an answer whose
+   * `proof` matches it, and the sender takes only an answer whose `mac` verifies.
+   * Offers from 0.1.2-beta and earlier leave it out.
+   */
+  answerCheck?: string
 }
 
 /** What a receiver sends back so the sender can start. It holds no key material. */
@@ -40,6 +46,10 @@ export type TransferAnswer = {
   maxPacketSize: number
   /** How far past its next block to deliver the receiver accepts blocks. Answers from 0.1.0-beta leave it out. */
   ahead?: number
+  /** 32 bytes, hex: shows the control plane that the receiver has the secret. */
+  proof?: string
+  /** 32 bytes, hex: shows the sender that these fields came from someone with the secret. */
+  mac?: string
 }
 
 export function parseOffer(value: unknown): TransferOffer {
@@ -64,6 +74,7 @@ export function parseOffer(value: unknown): TransferOffer {
   ) {
     throw new TeseraError("invalid", `an offer's sampleEvery must be a whole number from 1 to ${MAX_SAMPLE_EVERY}`)
   }
+  const check = optionalHex(offer["answerCheck"], "an offer's answerCheck")
   return {
     v: OFFER_VERSION,
     sessionId: sessionHex(offer["sessionId"]),
@@ -73,6 +84,7 @@ export function parseOffer(value: unknown): TransferOffer {
     n,
     ...(size === undefined ? {} : { size }),
     ...(sampleEvery === undefined ? {} : { sampleEvery }),
+    ...(check === undefined ? {} : { answerCheck: check }),
   }
 }
 
@@ -87,12 +99,16 @@ export function parseAnswer(value: unknown): TransferAnswer {
   if (ahead !== undefined && !(typeof ahead === "number" && Number.isInteger(ahead) && ahead >= 1)) {
     throw new TeseraError("invalid", "an answer's ahead must be a whole number of blocks")
   }
+  const proof = optionalHex(answer["proof"], "an answer's proof")
+  const mac = optionalHex(answer["mac"], "an answer's mac")
   return {
     v: OFFER_VERSION,
     sessionId: sessionHex(answer["sessionId"]),
     receiver: endpoint(answer["receiver"], "receiver"),
     maxPacketSize: max,
     ...(ahead !== undefined ? { ahead } : {}),
+    ...(proof !== undefined ? { proof } : {}),
+    ...(mac !== undefined ? { mac } : {}),
   }
 }
 
@@ -136,6 +152,12 @@ function sessionHex(value: unknown): string {
   if (typeof value !== "string" || !new RegExp(`^[0-9a-f]{${SESSION_ID_LEN * 2}}$`).test(value)) {
     throw new TeseraError("invalid", `a session id is ${SESSION_ID_LEN} bytes of lowercase hex`)
   }
+  return value
+}
+
+function optionalHex(value: unknown, what: string): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== "string" || !ANSWER_HEX.test(value)) throw new TeseraError("invalid", `${what} is 32 bytes of lowercase hex`)
   return value
 }
 
