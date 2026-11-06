@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import { isRoomId, MAX_DOCUMENT_BYTES, Rendezvous, RendezvousError, RENDEZVOUS_TTL_MS } from "../src/control/rendezvous.js"
+import { answerCheck, answerProof } from "../src/crypto/answer.js"
 
 const SESSION = "0123456789abcdef0123456789abcdef"
 const offer = (fields: Record<string, unknown> = {}) =>
@@ -86,6 +87,35 @@ describe("rendezvous", () => {
     const { room } = rooms.create(offer())
     rooms.answer(room, answer())
     refused(() => rooms.offer(room), 409, "answered")
+  })
+
+  it("takes only an answer with the proof when the offer carries a check", () => {
+    const { rooms } = store()
+    const proof = answerProof(Buffer.alloc(32, 1), Buffer.from(SESSION, "hex"))
+    const { room } = rooms.create(offer({ answerCheck: answerCheck(proof).toString("hex") }))
+    refused(() => rooms.answer(room, answer()), 403, "proof")
+    refused(() => rooms.answer(room, answer({ proof: "00".repeat(32) })), 403, "proof")
+    const other = answerProof(Buffer.alloc(32, 2), Buffer.from(SESSION, "hex")).toString("hex")
+    refused(() => rooms.answer(room, answer({ proof: other })), 403, "proof")
+    // None of those took the slot, so the receiver with the secret still can.
+    assert.ok(rooms.offer(room).offer)
+    const honest = answer({ proof: proof.toString("hex") })
+    rooms.answer(room, honest)
+    rooms.answer(room, honest)
+    refused(() => rooms.offer(room), 409, "answered")
+  })
+
+  it("takes any answer for an offer without a check, as before", () => {
+    const { rooms } = store()
+    const { room } = rooms.create(offer())
+    rooms.answer(room, answer({ proof: "not checked" }))
+    refused(() => rooms.offer(room), 409, "answered")
+  })
+
+  it("refuses an offer whose check is malformed", () => {
+    const { rooms } = store()
+    refused(() => rooms.create(offer({ answerCheck: "zz" })), 400, "document")
+    refused(() => rooms.create(offer({ answerCheck: 7 })), 400, "document")
   })
 
   it("refuses an answer for another session", () => {

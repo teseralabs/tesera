@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto"
-import { type Socket } from "node:dgram"
 import { type Server } from "node:http"
-import { bindUdp, closeUdp, createUdpSocket, isLoopback, normalizeHost, sendUdp, type Endpoint } from "../carrier/udp.js"
+import { bindUdp, closeUdp, createUdpSocket, isLoopback, normalizeHost, type Endpoint } from "../carrier/udp.js"
+import type { OpenTransport } from "../carrier/transport.js"
+import { systemClock, unrefTimer, type Clock } from "../clock.js"
 import {
   MAX_FORWARD_DATAGRAM,
   TABLE_NONCE_TTL_MS,
@@ -72,6 +73,10 @@ import { sleep } from "../util.js"
 type RememberedRelay = IntroducedRelay & { seenAt: number; quiet: boolean }
 
 export type RelayOptions = {
+  /** Where time comes from. Omitted means the system clock. */
+  clock?: Clock
+  /** How packets travel, in tests. Omitted means a UDP socket on `host:port`. */
+  transport?: OpenTransport
   adversity?: Partial<Adversity>
   seed?: number
   allowRemote?: boolean
@@ -159,12 +164,23 @@ class JoinError extends Error {
   }
 }
 
+/** What the relay sends through: its UDP socket, or a caller's transport. */
+type RelaySocket = {
+  send(packet: Uint8Array, port: number, host: string, done?: (err: Error | null) => void): void
+}
+
+function sendVia(socket: RelaySocket, packet: Uint8Array, to: Endpoint): Promise<void> {
+  return new Promise((resolve, reject) => socket.send(packet, to.port, to.host, (err) => (err ? reject(err) : resolve())))
+}
+
 export class Relay {
   private readonly opts: RelayOptions
-  private socket: Socket | null = null
+  private socket: RelaySocket | null = null
+  private closeSocket: (() => Promise<void>) | null = null
+  private readonly clock: Clock
   private bound: Endpoint | null = null
   private closed = false
-  private readonly timers = new Set<NodeJS.Timeout>()
+  private readonly timers = new Set<unknown>()
   private readonly sim: PathSim
   private readonly identity: Identity | null
   private readonly peers = new Map<string, RememberedRelay>()
@@ -183,18 +199,18 @@ export class Relay {
   private startedAt = 0
   private usageSeq = 0
   private seedEndpoint: Endpoint | null = null
-  private usageTimer: NodeJS.Timeout | null = null
-  private peerTimer: NodeJS.Timeout | null = null
+  private usageTimer: unknown = null
+  private peerTimer: unknown = null
   private readonly settings: RelaySettings
   private readonly peerOfflineMs: number
   /** Totals loaded from the analytics file. This process's counters sit on top. */
   private storedBytes = 0
   private storedTransfers = 0
   private analyticsDirty = false
-  private analyticsTimer: NodeJS.Timeout | null = null
+  private analyticsTimer: unknown = null
   private peersDirty = false
-  private peersTimer: NodeJS.Timeout | null = null
-  private policyTimer: NodeJS.Timeout | null = null
+  private peersTimer: unknown = null
+  private policyTimer: unknown = null
   private readonly gate: PolicyGate | null
   private readonly localDelivery: LocalDelivery | null
   private readonly policyFile: string | null
@@ -208,14 +224,14 @@ export class Relay {
   private readonly recordClaims: RecordClaims | null
   private readonly recordFile: string | null
   private recordPacket: Buffer | null = null
-  private recordTimer: NodeJS.Timeout | null = null
-  private limitTimer: NodeJS.Timeout | null = null
+  private recordTimer: unknown = null
+  private limitTimer: unknown = null
   private joinTarget: JoinTarget | null = null
   private joinCheckMs = MEMBERSHIP_CHECK_MS
   private joinMaxCheckMs = MEMBERSHIP_CHECK_MAX_MS
   private joinAttemptMs = 1500
   private joinBackoffMs = 0
-  private membershipTimer: NodeJS.Timeout | null = null
+  private membershipTimer: unknown = null
   private limitsLogged: LimitedBy = emptyLimitedBy()
   readonly stats: RelayStats = emptyRelayStats()
   /** Test hook. Called with the inner frame of packets that are actually forwarded. */
@@ -224,8 +240,9 @@ export class Relay {
 
   constructor(opts: RelayOptions = {}) {
     this.opts = opts
+    this.clock = opts.clock ?? systemClock
     this.identity = opts.identity ?? null
-    this.sim = PathSim.from(fillAdversity(opts.adversity), opts.seed ?? 1)
+    this.sim = PathSim.from(fillAdversity(opts.adversity), opts.seed ?? 1, () => this.clock.now())
     const defaults = defaultRelaySettings()
     const peerTtlMs = opts.peerTtlMs ?? defaults.peerTtlMs
     if (!Number.isSafeInteger(peerTtlMs) || peerTtlMs < 0) throw new Error("peer ttl must be a non-negative integer")
@@ -278,22 +295,45 @@ export class Relay {
   }
 
   async start(): Promise<Endpoint> {
-    const socket = createUdpSocket()
-    this.socket = socket
-    this.bound = await bindUdp(socket, this.opts.host ?? "127.0.0.1", this.opts.port ?? 0)
-    this.startedAt = Date.now()
-    socket.on("message", (msg, rinfo) => {
-      this.onPacket(Buffer.from(msg), { host: rinfo.address, port: rinfo.port })
-    })
-    socket.on("error", () => {
-      this.stats.droppedInvalid++
-      this.emit("error", "error", { reason: "socket" })
-    })
-    const peerTimer = setInterval(() => this.sweepPeers(), 5000)
-    peerTimer.unref()
+    if (this.opts.transport) {
+      const transport = await this.opts.transport({
+        packet: (packet, from) => {
+          this.onPacket(Buffer.from(packet), from)
+        },
+        error: () => {
+          this.stats.droppedInvalid++
+          this.emit("error", "error", { reason: "socket" })
+        },
+      })
+      this.socket = {
+        send: (packet, port, host, done) => {
+          transport.send(packet, { host, port }).then(
+            () => done?.(null),
+            (err: unknown) => done?.(err instanceof Error ? err : new Error(String(err))),
+          )
+        },
+      }
+      this.closeSocket = () => transport.close()
+      this.bound = transport.endpoint
+    } else {
+      const socket = createUdpSocket()
+      this.socket = { send: (packet, port, host, done) => socket.send(packet, port, host, (err) => done?.(err ?? null)) }
+      this.closeSocket = () => closeUdp(socket)
+      this.bound = await bindUdp(socket, this.opts.host ?? "127.0.0.1", this.opts.port ?? 0)
+      socket.on("message", (msg, rinfo) => {
+        this.onPacket(Buffer.from(msg), { host: rinfo.address, port: rinfo.port })
+      })
+      socket.on("error", () => {
+        this.stats.droppedInvalid++
+        this.emit("error", "error", { reason: "socket" })
+      })
+    }
+    this.startedAt = this.clock.now()
+    const peerTimer = this.clock.setInterval(() => this.sweepPeers(), 5000)
+    unrefTimer(peerTimer)
     this.peerTimer = peerTimer
-    const limitTimer = setInterval(() => this.reportLimits(), this.opts.limitLogMs ?? LIMIT_LOG_MS)
-    limitTimer.unref()
+    const limitTimer = this.clock.setInterval(() => this.reportLimits(), this.opts.limitLogMs ?? LIMIT_LOG_MS)
+    unrefTimer(limitTimer)
     this.limitTimer = limitTimer
     try {
       await this.openRecord()
@@ -316,11 +356,11 @@ export class Relay {
   async join(seed: Endpoint, timeoutMs = 1500, pinned: string | null = null): Promise<string> {
     if (!this.identity || !this.socket || !this.bound) throw new Error("relay has not started")
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("join timeout must be >= 0")
-    const started = Date.now()
+    const started = this.clock.now()
     let answered = false
-    while (Date.now() - started <= timeoutMs) {
+    while (this.clock.now() - started <= timeoutMs) {
       if (this.closed || !this.socket) break
-      await sendUdp(this.socket, encodeJoin(), seed)
+      await sendVia(this.socket, encodeJoin(), seed)
       const table = await readRelayTable(seed, { timeoutMs: 200, attempts: 1 }).catch(() => null)
       if (table && pinned && table.id !== pinned) throw new PinnedSeedError(seed, table.id, pinned)
       if (table?.peers.some((peer) => peer.id === this.identity?.id)) {
@@ -328,7 +368,7 @@ export class Relay {
         return table.id
       }
       if (table) answered = true
-      await sleep(30)
+      await sleep(30, this.clock)
     }
     throw new JoinError(seed, answered ? "the seed answered but did not list this relay" : "the seed did not answer")
   }
@@ -343,7 +383,7 @@ export class Relay {
   async stayJoined(target: JoinTarget, opts: StayJoinedOptions = {}): Promise<void> {
     const startupMs = opts.startupMs ?? JOIN_STARTUP_MS
     const attemptMs = opts.attemptMs ?? 1500
-    const started = Date.now()
+    const started = this.clock.now()
     let delay = opts.firstRetryMs ?? 1000
     let lastError: Error | null = null
     for (let attempt = 1; ; attempt++) {
@@ -356,12 +396,12 @@ export class Relay {
         this.emit("error", "error", { reason: "join", addr: target.label, attempt })
       }
       if (this.closed) throw new Error("relay closed")
-      if (Date.now() - started + delay > startupMs) {
+      if (this.clock.now() - started + delay > startupMs) {
         const seconds = Math.round(startupMs / 1000)
         const why = lastError instanceof JoinError ? lastError.why : lastError.message
         throw new Error(`relay did not join ${target.label} within ${seconds}s: ${why}`)
       }
-      await sleep(delay)
+      await sleep(delay, this.clock)
       delay = Math.min(delay * 2, JOIN_RETRY_MAX_MS)
     }
     this.joinTarget = target
@@ -379,12 +419,12 @@ export class Relay {
 
   private scheduleMembership(waitMs: number): void {
     if (this.closed) return
-    if (this.membershipTimer) clearTimeout(this.membershipTimer)
-    const timer = setTimeout(() => {
+    if (this.membershipTimer) this.clock.clearTimeout(this.membershipTimer)
+    const timer = this.clock.setTimeout(() => {
       this.membershipTimer = null
       void this.checkMembership().then((next) => this.scheduleMembership(next))
     }, waitMs)
-    timer.unref()
+    unrefTimer(timer)
     this.membershipTimer = timer
   }
 
@@ -425,7 +465,7 @@ export class Relay {
     if (!this.identity || !this.socket || !this.seedEndpoint || this.closed) return
     this.usageSeq += 1
     try {
-      await sendUdp(
+      await sendVia(
         this.socket,
         encodeUsage(this.identity, this.usageSeq, this.ownBytes(), this.ownTransfers()),
         this.seedEndpoint,
@@ -461,7 +501,7 @@ export class Relay {
         host: this.bound.host,
         port: this.bound.port,
         online: true,
-        seen: Date.now(),
+        seen: this.clock.now(),
         bytes: this.ownBytes(),
         transfers: this.ownTransfers(),
       })
@@ -486,7 +526,7 @@ export class Relay {
   /** Counters for this process. Joined relays and the analytics file stay on `snapshot`. */
   report(): RelayReport {
     return {
-      uptimeMs: this.startedAt === 0 ? 0 : Math.max(0, Date.now() - this.startedAt),
+      uptimeMs: this.startedAt === 0 ? 0 : Math.max(0, this.clock.now() - this.startedAt),
       forwarded: this.stats.forwarded,
       bytes: this.stats.forwardedBytes,
       data: this.dataFrames,
@@ -523,23 +563,23 @@ export class Relay {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    if (this.usageTimer) clearInterval(this.usageTimer)
+    if (this.usageTimer) this.clock.clearInterval(this.usageTimer)
     this.usageTimer = null
-    if (this.peerTimer) clearInterval(this.peerTimer)
+    if (this.peerTimer) this.clock.clearInterval(this.peerTimer)
     this.peerTimer = null
-    if (this.analyticsTimer) clearInterval(this.analyticsTimer)
+    if (this.analyticsTimer) this.clock.clearInterval(this.analyticsTimer)
     this.analyticsTimer = null
-    if (this.peersTimer) clearInterval(this.peersTimer)
+    if (this.peersTimer) this.clock.clearInterval(this.peersTimer)
     this.peersTimer = null
-    if (this.policyTimer) clearInterval(this.policyTimer)
+    if (this.policyTimer) this.clock.clearInterval(this.policyTimer)
     this.policyTimer = null
-    if (this.recordTimer) clearInterval(this.recordTimer)
+    if (this.recordTimer) this.clock.clearInterval(this.recordTimer)
     this.recordTimer = null
-    if (this.limitTimer) clearInterval(this.limitTimer)
+    if (this.limitTimer) this.clock.clearInterval(this.limitTimer)
     this.limitTimer = null
-    if (this.membershipTimer) clearTimeout(this.membershipTimer)
+    if (this.membershipTimer) this.clock.clearTimeout(this.membershipTimer)
     this.membershipTimer = null
-    for (const timer of this.timers) clearTimeout(timer)
+    for (const timer of this.timers) this.clock.clearTimeout(timer)
     this.timers.clear()
     await this.flushAnalytics()
     await this.flushPeers()
@@ -547,9 +587,10 @@ export class Relay {
     this.http = null
     this.httpEndpoint = null
     if (http) await closeRelayApi(http).catch(() => {})
-    const socket = this.socket
+    const closeSocket = this.closeSocket
     this.socket = null
-    if (socket) await closeUdp(socket).catch(() => {})
+    this.closeSocket = null
+    if (closeSocket) await closeSocket().catch(() => {})
   }
 
   /**
@@ -620,14 +661,14 @@ export class Relay {
     }
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
     if (!admitted) {
-      const limited = this.gate?.admitDatagram(msg.length, session) ?? null
+      const limited = this.gate?.admitDatagram(msg.length, session, this.clock.now()) ?? null
       if (limited) {
         this.limit(limited)
         return false
       }
     }
     const spentWithAdmission = admitted && env.dest.host === remote.host && env.dest.port === remote.port
-    if (this.opts.allowRemote && !spentWithAdmission && !this.dests.spend(env.dest, env.inner.length)) {
+    if (this.opts.allowRemote && !spentWithAdmission && !this.dests.spend(env.dest, env.inner.length, this.clock.now())) {
       this.limit("destination")
       return false
     }
@@ -658,7 +699,7 @@ export class Relay {
       return true
     }
     if (decision.waitMs <= 0) return forward()
-    const timer = setTimeout(() => {
+    const timer = this.clock.setTimeout(() => {
       this.timers.delete(timer)
       forward()
     }, decision.waitMs)
@@ -687,13 +728,13 @@ export class Relay {
     if (startsEnvelope(env.inner)) return "invalid"
     if (startsIdentity(env.inner)) return "invalid"
     const session = peekRelayFrame(env.inner)?.sessionPrefix ?? null
-    const limited = this.gate?.admitDatagram(packet.length, session) ?? null
+    const limited = this.gate?.admitDatagram(packet.length, session, this.clock.now()) ?? null
     if (limited) {
       // The same counters a UDP arrival uses. A refusal here is the only charge, so it is counted once.
       this.limit(limited)
       return "limited"
     }
-    if (this.opts.allowRemote && !this.dests.spend(to, packet.length)) {
+    if (this.opts.allowRemote && !this.dests.spend(to, packet.length, this.clock.now())) {
       this.limit("destination")
       return "limited"
     }
@@ -817,7 +858,7 @@ export class Relay {
   /** Identity replies share the datagram and bandwidth budgets. The peer table waits for a second packet. */
   private sendIdentity(packet: Buffer, to: Endpoint): boolean {
     if (!this.socket) return false
-    const limited = this.gate?.admitDatagram(packet.length, null) ?? null
+    const limited = this.gate?.admitDatagram(packet.length, null, this.clock.now()) ?? null
     if (limited) {
       this.limit(limited)
       return false
@@ -829,7 +870,7 @@ export class Relay {
   private replyLookup(from: Endpoint, challenge: Buffer, nonce: Buffer | null): void {
     if (!this.identity) return
     const key = `${from.host}:${from.port}`
-    const now = Date.now()
+    const now = this.clock.now()
     this.sweepTable(now)
     const readyAt = this.tableReady.get(key)
     if (readyAt !== undefined) {
@@ -883,16 +924,16 @@ export class Relay {
     } catch {
       return
     }
-    this.dests.markReachable(from)
+    this.dests.markReachable(from, this.clock.now())
   }
 
   private armUsage(seed: Endpoint): void {
     this.seedEndpoint = seed
-    if (this.usageTimer) clearInterval(this.usageTimer)
-    const timer = setInterval(() => {
+    if (this.usageTimer) this.clock.clearInterval(this.usageTimer)
+    const timer = this.clock.setInterval(() => {
       void this.publishUsage()
     }, 5000)
-    timer.unref()
+    unrefTimer(timer)
     this.usageTimer = timer
     void this.publishUsage()
   }
@@ -900,7 +941,7 @@ export class Relay {
   private invite(from: Endpoint): void {
     if (!this.socket || from.port < 1) return
     const key = `${from.host}:${from.port}`
-    const now = Date.now()
+    const now = this.clock.now()
     let pending = this.pending.get(key)
     if (!pending || now - pending.at >= 2000) {
       pending = { challenge: randomBytes(16), at: now }
@@ -932,13 +973,13 @@ export class Relay {
       this.reject(id, decision, `${from.host}:${from.port}`)
       return
     }
-    if (!this.peers.has(id) && this.gate && !this.gate.admitJoin()) {
+    if (!this.peers.has(id) && this.gate && !this.gate.admitJoin(this.clock.now())) {
       this.reject(id, "rate", `${from.host}:${from.port}`)
       return
     }
     if (!this.makeRoom(id)) return
     const previous = this.peers.get(id)
-    const peer = { id, endpoint: from, seenAt: Date.now(), quiet: false }
+    const peer = { id, endpoint: from, seenAt: this.clock.now(), quiet: false }
     this.peers.set(id, peer)
     this.markPeers()
     const addr = `${from.host}:${from.port}`
@@ -961,7 +1002,7 @@ export class Relay {
     }
     const moved = peer.endpoint.host !== from.host || peer.endpoint.port !== from.port
     peer.endpoint = from
-    peer.seenAt = Date.now()
+    peer.seenAt = this.clock.now()
     this.markPeers()
     const addr = `${from.host}:${from.port}`
     if (peer.quiet) {
@@ -989,7 +1030,7 @@ export class Relay {
   }
 
   /** Hide a relay that stopped reporting, and forget it once the keep window ends. */
-  private sweepPeers(now = Date.now()): void {
+  private sweepPeers(now = this.clock.now()): void {
     const hideAfter = this.peerOfflineMs
     const forgetAfter = this.peerOfflineMs + this.settings.peerTtlMs
     for (const peer of this.peers.values()) {
@@ -1030,10 +1071,10 @@ export class Relay {
     this.storedBytes = totals.bytes
     this.storedTransfers = totals.transfers
     await writeAnalytics(path, totals)
-    const timer = setInterval(() => {
+    const timer = this.clock.setInterval(() => {
       void this.flushAnalytics()
     }, 1000)
-    timer.unref()
+    unrefTimer(timer)
     this.analyticsTimer = timer
   }
 
@@ -1072,10 +1113,10 @@ export class Relay {
     this.sweepPeers()
     await writePeers(path, this.peerRecords())
     this.peersDirty = false
-    const timer = setInterval(() => {
+    const timer = this.clock.setInterval(() => {
       void this.flushPeers()
     }, 1000)
-    timer.unref()
+    unrefTimer(timer)
     this.peersTimer = timer
   }
 
@@ -1127,7 +1168,7 @@ export class Relay {
   }
 
   private nowSec(): number {
-    return Math.floor(Date.now() / 1000)
+    return Math.floor(this.clock.now() / 1000)
   }
 
   private async openRecord(): Promise<void> {
@@ -1147,10 +1188,10 @@ export class Relay {
       this.emit("error", "error", { reason: "record" })
       return
     }
-    const timer = setInterval(() => {
+    const timer = this.clock.setInterval(() => {
       void this.refreshRecord()
     }, 60_000)
-    timer.unref()
+    unrefTimer(timer)
     this.recordTimer = timer
   }
 
@@ -1227,10 +1268,10 @@ export class Relay {
       blocked,
       forget: latest.forget.filter((id) => !done.has(id)),
     })
-    const timer = setInterval(() => {
+    const timer = this.clock.setInterval(() => {
       void this.refreshPolicy()
     }, 1000)
-    timer.unref()
+    unrefTimer(timer)
     this.policyTimer = timer
   }
 

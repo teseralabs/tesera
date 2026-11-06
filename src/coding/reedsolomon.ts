@@ -113,7 +113,9 @@ export function decodeShards(
     }
     systematic.push(shard)
   }
-  if (haveSystematic) return systematic.map((shard) => Uint8Array.from(shard))
+  // The data shards are already here. They are returned as they are, so the caller must not
+  // change them; joinShards copies them into a new buffer.
+  if (haveSystematic) return systematic
 
   const chosen = [...unique.entries()].sort((a, b) => a[0] - b[0]).slice(0, k)
   const shardLen = chosen[0]?.[1].length

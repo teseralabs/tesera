@@ -130,6 +130,10 @@ export type TransferMetrics = {
   blocksMissingSystematic: number
   tesseraSends: number
   tesseraRetransmissions: number
+  /** Samples that came back and gave the sender a round trip. */
+  samplesAnswered: number
+  meanSampleRttMs: number
+  windowCuts: number
   nacksSent: number
   acksSent: number
   maxBufferedBlocks: number
@@ -162,6 +166,9 @@ export function buildMetrics(
     blocksMissingSystematic: receiver.blocksMissingSystematic,
     tesseraSends: sender.tesseraSends,
     tesseraRetransmissions: sender.tesseraRetransmissions,
+    samplesAnswered: sender.sampleRttCount,
+    meanSampleRttMs: sender.sampleRttCount > 0 ? sender.sampleRttSumMs / sender.sampleRttCount : 0,
+    windowCuts: sender.windowCuts,
     nacksSent: receiver.nacksSent,
     acksSent: receiver.acksSent,
     maxBufferedBlocks: receiver.maxBufferedBlocks,

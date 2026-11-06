@@ -9,20 +9,45 @@ import { Relay } from "../src/relay/relay.js"
 import { TeseraReceiver } from "../src/transport/receiver.js"
 import { TeseraSender } from "../src/transport/sender.js"
 import { sleep } from "../src/util.js"
+import { MemoryNetwork } from "./memory-network.js"
+import { VirtualClock } from "./virtual-clock.js"
 
 const open = { access: "open" as const, maxSessions: 8, peerRatePerMin: 0 }
 
 type Moved = { output: Buffer; sender: TeseraSender; receiver: TeseraReceiver; seconds: number }
 
+/**
+ * Relays and both ends on one in-memory network and one virtual clock, so a busy machine can't change
+ * the timing. Each hop takes 1 ms, as a nearby relay would.
+ */
+type Virtual = { clock: VirtualClock; net: MemoryNetwork }
+
+function virtual(): Virtual {
+  const clock = new VirtualClock()
+  return { clock, net: new MemoryNetwork(clock, 1) }
+}
+
+/** Run a test body on its virtual clock. */
+function onClock(run: (env: Virtual) => Promise<void>): () => Promise<void> {
+  return async () => {
+    const env = virtual()
+    await env.clock.run(run(env))
+  }
+}
+
 /** Send through relays that are already running. The receiver lingers like `tesera recv`. */
 async function move(
   relays: Endpoint[],
   payload: Buffer,
-  opts: { k?: number; n?: number; maxSends?: number; linger?: boolean; idleMs?: number } = {},
+  opts: { k?: number; n?: number; maxSends?: number; linger?: boolean; idleMs?: number; env?: Virtual } = {},
 ): Promise<Moved> {
   const session = randomBytes(32)
-  const receiver = new TeseraReceiver({ session, relays, sender: { host: "127.0.0.1", port: 9 } })
+  const env = opts.env
+  const wire = () => (env ? { clock: env.clock, transport: env.net.transport() } : {})
+  const now = () => (env ? env.clock.mono() : performance.now())
+  const receiver = new TeseraReceiver({ session, relays, sender: { host: "127.0.0.1", port: 9 }, ...wire() })
   const sender = new TeseraSender({
+    ...wire(),
     session,
     relays,
     receiver: await receiver.start(),
@@ -42,12 +67,12 @@ async function move(
     if (opts.linger ?? true) await receiver.linger()
     await receiver.close()
   })()
-  const started = performance.now()
+  const started = now()
   try {
     await sender.write(payload)
     await sender.end()
     await reading
-    return { output: Buffer.concat(chunks), sender, receiver, seconds: (performance.now() - started) / 1000 }
+    return { output: Buffer.concat(chunks), sender, receiver, seconds: (now() - started) / 1000 }
   } catch (err) {
     receiver.fail(err)
     await reading.catch(() => {})
@@ -63,10 +88,12 @@ async function relays(
   policy: Partial<OperatorPolicy>,
   log?: (line: string) => void,
   limitLogMs = 100,
+  env?: Virtual,
 ): Promise<Relay[]> {
   const out: Relay[] = []
   for (let i = 0; i < count; i++) {
-    const relay = new Relay({ host: "127.0.0.1", policy, log, logLevel: "info", limitLogMs })
+    const wire = env ? { clock: env.clock, transport: env.net.transport() } : {}
+    const relay = new Relay({ host: "127.0.0.1", policy, log, logLevel: "info", limitLogMs, ...wire })
     await relay.start()
     out.push(relay)
   }
@@ -90,12 +117,12 @@ describe("relay limits and transfers", () => {
     assert.equal(gate.admitDatagram(1, "a", now), "datagram")
   })
 
-  it("slows a transfer down at 100 datagrams a second instead of failing", async () => {
+  it("slows a transfer down at 100 datagrams a second instead of failing", onClock(async (env) => {
     const lines: string[] = []
-    const set = await relays(1, { ...open, datagramRatePerSec: 100, bandwidthBps: 0 }, (line) => lines.push(line))
+    const set = await relays(1, { ...open, datagramRatePerSec: 100, bandwidthBps: 0 }, (line) => lines.push(line), 100, env)
     try {
       const payload = randomBytes(120_000)
-      const moved = await move(set.map((relay) => relay.endpoint), payload)
+      const moved = await move(set.map((relay) => relay.endpoint), payload, { env })
       assert.deepEqual(moved.output, payload)
       assert.ok(moved.seconds > 1, `took ${moved.seconds}s`)
       const report = set[0]!.report()
@@ -105,32 +132,32 @@ describe("relay limits and transfers", () => {
     } finally {
       for (const relay of set) await relay.close()
     }
-  })
+  }))
 
-  it("slows a transfer down at a 1 mbps bandwidth cap instead of failing", async () => {
-    const set = await relays(1, { ...open, datagramRatePerSec: 0, bandwidthBps: 125_000 })
+  it("slows a transfer down at a 1 mbps bandwidth cap instead of failing", onClock(async (env) => {
+    const set = await relays(1, { ...open, datagramRatePerSec: 0, bandwidthBps: 125_000 }, undefined, 100, env)
     try {
       const payload = randomBytes(400_000)
-      const moved = await move(set.map((relay) => relay.endpoint), payload)
+      const moved = await move(set.map((relay) => relay.endpoint), payload, { env })
       assert.deepEqual(moved.output, payload)
       assert.ok(moved.seconds > 1.5, `took ${moved.seconds}s`)
       assert.ok(set[0]!.report().limitedBy.bandwidth > 0)
     } finally {
       for (const relay of set) await relay.close()
     }
-  })
+  }))
 
-  it("slows a 2-of-3 transfer down when every relay allows 100 datagrams a second", async () => {
-    const set = await relays(3, { ...open, datagramRatePerSec: 100, bandwidthBps: 0 })
+  it("slows a 2-of-3 transfer down when every relay allows 100 datagrams a second", onClock(async (env) => {
+    const set = await relays(3, { ...open, datagramRatePerSec: 100, bandwidthBps: 0 }, undefined, 100, env)
     try {
       const payload = randomBytes(150_000)
-      const moved = await move(set.map((relay) => relay.endpoint), payload, { k: 2, n: 3 })
+      const moved = await move(set.map((relay) => relay.endpoint), payload, { k: 2, n: 3, env })
       assert.deepEqual(moved.output, payload)
       assert.ok(set.some((relay) => relay.report().limitedBy.datagram > 0))
     } finally {
       for (const relay of set) await relay.close()
     }
-  })
+  }))
 
   it("finishes when the last ACKs are lost, because the receiver keeps answering", async () => {
     const lossy = await ackDropper()

@@ -1,6 +1,7 @@
 import type { Endpoint } from "../src/carrier/transport.js"
 import type { OpenTransport, PacketTransport, TransportEvents } from "../src/carrier/transport.js"
 import { decodeEnvelope, startsEnvelope } from "../src/protocol/envelope.js"
+import type { Clock } from "../src/clock.js"
 
 /**
  * Packets between transports in one process, for tests. Each packet arrives
@@ -12,6 +13,15 @@ export class MemoryNetwork {
   private readonly nodes = new Map<string, TransportEvents>()
   private readonly aliases = new Map<string, string>()
   private nextPort = 40000
+
+  /**
+   * With a clock, each packet arrives on a timer of that clock, `hopMs` after it was sent, instead of
+   * on the next turn of the event loop.
+   */
+  constructor(
+    private readonly clock?: Clock,
+    private readonly hopMs = 0,
+  ) {}
 
   transport(host = "127.0.0.1", port = 0, maxPacketSize = 65535): OpenTransport {
     return async (events) => {
@@ -28,7 +38,9 @@ export class MemoryNetwork {
           if (packet.length > maxPacketSize) throw new Error(`packet of ${packet.length} exceeds ${maxPacketSize}`)
           const copy = Buffer.from(packet)
           this.sent.push({ from: endpoint, to, packet: copy })
-          setImmediate(() => this.deliver(copy, endpoint, to))
+          const deliver = () => this.deliver(copy, endpoint, to)
+          if (this.clock) this.clock.setTimeout(deliver, this.hopMs)
+          else setImmediate(deliver)
         },
         close: async () => {
           closed = true

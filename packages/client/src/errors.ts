@@ -14,9 +14,11 @@
  *   stopped because it failed. A silent peer is not a cancel
  * - `source`: reading the input failed
  * - `sink`: writing the output failed
- * - `invalid`: an option, offer, answer, or secret is malformed
+ * - `invalid`: an option, offer, answer, or secret is malformed. `reason` is `unauthenticated` for an
+ *   answer that was not made with the transfer's secret
  * - `control`: the control plane could not be reached, or refused: `reason` carries its error, such
- *   as `not_found` for a room that expired or was closed, or `answered` for a room another receiver joined
+ *   as `not_found` for a room that expired or was closed, `answered` for a room another receiver joined,
+ *   or `proof` for an answer without the secret's proof
  */
 export type TeseraErrorCode =
   | "unsupported"

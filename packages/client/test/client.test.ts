@@ -2,10 +2,11 @@ import assert from "node:assert/strict"
 import { createHash, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { describe, it } from "node:test"
-import { memorySink, TeseraClient, TeseraError, type ClientTransport, type Progress, type SinkWriter, type Source, type TransportEvents } from "../src/index.js"
+import { memorySink, TeseraClient, TeseraError, type ClientTransport, type Progress, type SinkWriter, type Source, type TransferOffer, type TransportEvents } from "../src/index.js"
 import { reportedFailure } from "../src/errors.js"
 import { CRC_LEN, DATA_HEADER_LEN, DEFAULT_WINDOW, FRAME_DATA, PROTOCOL_VERSION } from "../../../src/constants.js"
 import { crc32 } from "../../../src/protocol/crc32.js"
+import { proofMatches } from "../../../src/crypto/answer.js"
 import { CHUNK_BYTES } from "../src/source.js"
 import { memoryWorld, type MemoryWorld } from "./memory-transport.js"
 
@@ -74,6 +75,8 @@ async function pair(
     sendSignal?: AbortSignal
     recvSignal?: AbortSignal
     idleMs?: number
+    /** Change the offer on its way to the receiver, as an older client or the control plane might. */
+    rewriteOffer?: (offer: Record<string, unknown>) => Record<string, unknown>
   } = {},
 ) {
   const sendTransport = world.transport(opts.senderPacket)
@@ -88,7 +91,7 @@ async function pair(
     signal: opts.sendSignal,
   })
   const incoming = await receiver.receive({
-    offer: JSON.parse(JSON.stringify(outgoing.offer)),
+    offer: (opts.rewriteOffer ?? ((offer) => offer))(JSON.parse(JSON.stringify(outgoing.offer))) as TransferOffer,
     secret: outgoing.secret,
     sink: opts.sink ?? out.sink,
     hash: true,
@@ -136,7 +139,7 @@ describe("TeseraClient over a custom transport", () => {
         onSendProgress: (p) => sendProgress.push(p),
         onRecvProgress: (p) => recvProgress.push(p),
       })
-      assert.deepEqual([outgoing.offer.k, outgoing.offer.n, outgoing.offer.size], [2, 3, payload.length])
+      assert.deepEqual([outgoing.offer.k, outgoing.offer.n, outgoing.offer.size, outgoing.offer.sampleEvery], [2, 3, payload.length, 4])
       const [sent, received] = await Promise.all([outgoing.start(incoming.answer), incoming.done])
       assert.equal(received.bytes, payload.length)
       assert.equal(received.sha256, sha(payload))
@@ -150,6 +153,18 @@ describe("TeseraClient over a custom transport", () => {
         for (let i = 1; i < progress.length; i++) assert.ok((progress[i]?.bytes ?? 0) >= (progress[i - 1]?.bytes ?? 0))
       }
       assert.ok(await settled(() => sendTransport.open() === 0 && recvTransport.open() === 0))
+    })
+  })
+
+  it("finishes with a receiver that samples every block, as one from before sampleEvery does", async () => {
+    await withWorld(async (world) => {
+      const payload = randomBytes(1_000_000)
+      const { outgoing, incoming } = await pair(world, payload, {
+        rewriteOffer: ({ sampleEvery: _dropped, ...offer }) => offer,
+      })
+      const [sent, received] = await Promise.all([outgoing.start(incoming.answer), incoming.done])
+      assert.equal(received.sha256, sha(payload))
+      assert.equal(sent.sha256, sha(payload))
     })
   })
 
@@ -511,12 +526,48 @@ describe("errors", () => {
       await rejectsWith(client.receive({ offer: { ...outgoing.offer, relays: [] }, secret: outgoing.secret, sink }), "invalid")
       await rejectsWith(client.receive({ offer: { ...outgoing.offer, v: 9 as 1 }, secret: outgoing.secret, sink }), "incompatible")
       await rejectsWith(client.receive({ offer: outgoing.offer, secret: "00", sink }), "invalid")
+      for (const sampleEvery of [0, 17, 1.5, "4"]) {
+        await rejectsWith(client.receive({ offer: { ...outgoing.offer, sampleEvery: sampleEvery as number }, secret: outgoing.secret, sink }), "invalid")
+      }
       await rejectsWith(
         outgoing.start({ v: 1, sessionId: "00".repeat(16), receiver: { host: "127.0.0.1", port: 1 }, maxPacketSize: 1200 }),
         "invalid",
       )
       await rejectsWith(client.send(randomBytes(10), { relays: [] }), "invalid")
       await rejectsWith(client.send(randomBytes(10), { relays: world.relays.map((r) => r.endpoint), coding: { k: 3, n: 2 } }), "invalid")
+    })
+  })
+
+  it("refuses an answer not made with the transfer's secret", async () => {
+    await withWorld(async (world) => {
+      const { outgoing, incoming } = await pair(world, randomBytes(10))
+      const real = incoming.answer
+      const { mac: _mac, ...unsigned } = real
+      const forged = { ...real, mac: "00".repeat(32) }
+      const moved = { ...real, receiver: { ...real.receiver, port: real.receiver.port + 1 } }
+      for (const answer of [unsigned, forged, moved]) {
+        const other = await pair(world, randomBytes(10))
+        await assert.rejects(other.outgoing.start({ ...answer, sessionId: other.outgoing.offer.sessionId }), (err: unknown) => {
+          assert.ok(err instanceof TeseraError)
+          assert.equal(err.code, "invalid")
+          assert.equal(err.reason, "unauthenticated")
+          return true
+        })
+        other.incoming.cancel()
+      }
+      await assert.rejects(outgoing.start(moved), (err: unknown) => err instanceof TeseraError && err.reason === "unauthenticated")
+      incoming.cancel()
+    })
+  })
+
+  it("carries a check in the offer that the receiver's proof matches", async () => {
+    await withWorld(async (world) => {
+      const { outgoing, incoming } = await pair(world, randomBytes(10))
+      assert.match(outgoing.offer.answerCheck ?? "", /^[0-9a-f]{64}$/)
+      assert.ok(proofMatches(outgoing.offer.answerCheck ?? "", incoming.answer.proof))
+      assert.match(incoming.answer.mac ?? "", /^[0-9a-f]{64}$/)
+      const [sent] = await Promise.all([outgoing.start(incoming.answer), incoming.done])
+      assert.equal(sent.bytes, 10)
     })
   })
 

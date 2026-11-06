@@ -211,7 +211,7 @@ npm run tesera -- api --listen 127.0.0.1:4190 --discover relay:ID@203.0.113.10:4
 
 put HTTPS in front of it for pages. [attachment relays](https://tesera.net/docs#attach) and [api](https://tesera.net/docs#api) cover both in more detail
 
-the published WebTransport binaries don't support safari yet. safari requires an attachment relay with a compatible WebTransport implementation
+the published WebTransport binaries don't support safari yet. safari opens a stream only once the relay grants it credit with the `WT_MAX_STREAMS` and `WT_MAX_DATA` capsules, which those binaries never send, so it needs an attachment relay whose WebTransport implementation does
 
 ## versions
 

@@ -234,6 +234,51 @@ describe("corrupted tessera recovery", () => {
       await receiver.close()
     }
   })
+
+  it("drops a frame whose shard is not cut to its own length", async () => {
+    const secret = randomBytes(32)
+    const body = Buffer.from("cut to length")
+    const frames = blockFrames(secret, 0, body, true, 2, 3)
+    const honest = data(frames[0] ?? Buffer.alloc(0))
+    const miscut = encodeData({ ...honest, cipherLen: 2 })
+    const { receiver, send } = await start(secret)
+    try {
+      await send(miscut)
+      await send(otherLength(frames[0] ?? Buffer.alloc(0), 4))
+      for (const frame of frames) await send(frame)
+      assert.deepEqual(await receiver.read(), body)
+    } finally {
+      await receiver.close()
+    }
+  })
+
+  it("keeps a slot for the full length once a full block has opened", { timeout: 10_000 }, async () => {
+    const secret = randomBytes(32)
+    const sessionId = randomBytes(16)
+    const first = Buffer.alloc(40, 1)
+    const middle = Buffer.alloc(40, 2)
+    const last = Buffer.from("tail")
+    const block0 = blockFrames(secret, 0, first, false, 2, 3, sessionId)
+    const block1 = blockFrames(secret, 1, middle, false, 2, 3, sessionId)
+    const block2 = blockFrames(secret, 2, last, true, 2, 3, sessionId)
+    const { receiver, send } = await start(secret)
+    try {
+      for (const frame of block0) await send(frame)
+      assert.deepEqual(await receiver.read(), first)
+      // Before the pin, these two lengths would fill both slots and the honest set would be dropped.
+      await send(otherLength(block1[0] ?? Buffer.alloc(0), 1))
+      await send(otherLength(block1[0] ?? Buffer.alloc(0), 2))
+      // Longer than a full block, so it can never be honest.
+      await send(otherLength(block1[0] ?? Buffer.alloc(0), data(block1[0] ?? Buffer.alloc(0)).cipherLen + 2))
+      for (const frame of block1) await send(frame)
+      assert.deepEqual(await receiver.read(), middle)
+      for (const frame of block2) await send(frame)
+      assert.deepEqual(await receiver.read(), last)
+      assert.equal(await receiver.read(), null)
+    } finally {
+      await receiver.close()
+    }
+  })
 })
 
 async function start(secret: Buffer, coding?: { k: number; n: number }): Promise<{ receiver: TeseraReceiver; send: (packet: Buffer) => Promise<void> }> {
@@ -244,6 +289,8 @@ async function start(secret: Buffer, coding?: { k: number; n: number }): Promise
     relays: [relay],
     ...(coding ? { coding } : {}),
   })
+  const senderSocket = createUdpSocket()
+  receiver.setSender(await bindUdp(senderSocket, "127.0.0.1", 0))
   const bound = await receiver.start()
   const send = async (packet: Buffer) => {
     await sendUdp(socket, packet, bound)
@@ -252,12 +299,12 @@ async function start(secret: Buffer, coding?: { k: number; n: number }): Promise
   receiver.close = async () => {
     await close()
     await closeUdp(socket)
+    await closeUdp(senderSocket)
   }
   return { receiver, send }
 }
 
-function blockFrames(secret: Buffer, blockId: number, body: Buffer, fin: boolean, k: number, n: number): Buffer[] {
-  const sessionId = randomBytes(16)
+function blockFrames(secret: Buffer, blockId: number, body: Buffer, fin: boolean, k: number, n: number, sessionId = randomBytes(16)): Buffer[] {
   const keys = deriveKeys(secret, sessionId)
   const cipherLen = sealedLength(body.length)
   const shardLen = Math.ceil(cipherLen / k)
@@ -290,6 +337,9 @@ function corrupt(frame: Buffer): Buffer {
   return encodeData({ ...decoded, payload })
 }
 
+/** A length an honest sender could have used: the payload is cut to ceil(cipherLen / k). */
 function otherLength(frame: Buffer, cipherLen: number): Buffer {
-  return encodeData({ ...data(frame), cipherLen, tesseraIndex: 0 })
+  const decoded = data(frame)
+  const shardLen = Math.ceil(cipherLen / decoded.k)
+  return encodeData({ ...decoded, cipherLen, tesseraIndex: 0, payload: Buffer.alloc(shardLen, 3) })
 }

@@ -87,3 +87,23 @@ export function fullBlockBodySize(k: number, shardSize: number): number {
   }
   return capacity
 }
+
+/** Blocks at the start of a transfer that are always sampled, so the first round trips are measured quickly. */
+export const SAMPLE_ALL_FIRST = 16
+/** The sparsest sampling a sender may ask for: one block in this many. */
+export const MAX_SAMPLE_EVERY = 16
+
+/**
+ * Whether the receiver sends a SAMPLE for every tessera of this block. Both ends compute it from the
+ * same rule, so the sender only waits for samples that will come. 1 samples every block, as every
+ * release before this one does.
+ */
+export function sampledBlock(blockId: number, every: number): boolean {
+  return every <= 1 || blockId < SAMPLE_ALL_FIRST || blockId % every === 0
+}
+
+export function assertSampleEvery(every: number): void {
+  if (!Number.isInteger(every) || every < 1 || every > MAX_SAMPLE_EVERY) {
+    throw new Error(`sampleEvery must be a whole number from 1 to ${MAX_SAMPLE_EVERY}`)
+  }
+}
