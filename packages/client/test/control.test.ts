@@ -4,6 +4,8 @@
 import assert from "node:assert/strict"
 import { createHash, randomBytes } from "node:crypto"
 import { after, before, describe, it } from "node:test"
+import { answerProof } from "../../../src/crypto/answer.js"
+import { toHex } from "../src/offer.js"
 import {
   httpControlPlane,
   joinTransfer,
@@ -242,13 +244,16 @@ describe("share and join through a control plane", () => {
     await Promise.all([share.done, incoming.done])
   })
 
-  it("refuses a stale answer for another session, and still takes the real one", async () => {
+  it("refuses an answer without the secret's proof, and still takes the real one", async () => {
     const payload = randomBytes(20_000)
     const { sender, receiver } = clients()
     const share = await shareTransfer(sender, control, payload)
-    const stale = { v: 1, sessionId: "f".repeat(32), receiver: { host: "127.0.0.1", port: 9 }, maxPacketSize: 1200 }
-    const response = await fetch(`${base}/v1/rooms/${share.room}/answer`, { method: "POST", body: JSON.stringify(stale) })
-    assert.equal(response.status, 409)
+    const sessionId = share.transfer.offer.sessionId
+    const forged = { v: 1, sessionId, receiver: { host: "127.0.0.1", port: 9 }, maxPacketSize: 1200 }
+    for (const answer of [forged, { ...forged, proof: "00".repeat(32) }, { ...forged, sessionId: "f".repeat(32) }]) {
+      const response = await fetch(`${base}/v1/rooms/${share.room}/answer`, { method: "POST", body: JSON.stringify(answer) })
+      assert.equal(response.status, 403)
+    }
     const out = collect()
     const incoming = await joinTransfer(receiver, control, { room: share.room, secret: share.secret, sink: out.sink })
     await Promise.all([share.done, incoming.done])
@@ -265,7 +270,10 @@ describe("share and join through a control plane", () => {
   it("refuses a malformed answer at the sender", async () => {
     const { sender } = clients()
     const share = await shareTransfer(sender, control, randomBytes(1000))
-    const bad = { v: 1, sessionId: share.transfer.offer.sessionId, maxPacketSize: 1200 }
+    const sessionId = share.transfer.offer.sessionId
+    // The proof gets it past the control plane, so the sender's own check is what refuses it.
+    const proof = toHex(answerProof(Buffer.from(share.secret, "hex"), Buffer.from(sessionId, "hex")))
+    const bad = { v: 1, sessionId, maxPacketSize: 1200, proof }
     assert.equal((await fetch(`${base}/v1/rooms/${share.room}/answer`, { method: "POST", body: JSON.stringify(bad) })).status, 204)
     await rejectsWith(share.done, "invalid")
   })
