@@ -44,6 +44,12 @@ const CUBIC_C = 0.4
 const TRANSPORT_HELD_MS = 2
 /** The cut for a lost ACK on a block the receiver already holds. */
 const ACK_LOSS_BETA = 0.9
+/**
+ * The send count at which a block's repairs keep being lost: the first send and four resends. A
+ * rate limit drops the same stuck block again and again. Random loss rarely does that 4 times
+ * running, so heavy random loss does not collapse the window.
+ */
+const COLLAPSE_AT_SENDS = 5
 
 type Placement = {
   relay: number
@@ -637,6 +643,7 @@ export class TeseraSender {
     // With k tesserae sampled the receiver holds the block, so what went missing was its ACK: often
     // one random loss, but a return path at an operator's limit drops ACKs too, so it still counts.
     this.noteLoss(block.id, block.sampled.size >= this.k ? ACK_LOSS_BETA : CUBIC_BETA)
+    if (block.sends >= COLLAPSE_AT_SENDS && block.sampled.size < this.k) this.collapse()
     for (const index of indices) {
       if (this.stopped || block.acked) return
       const place = block.placements[index]
@@ -749,6 +756,28 @@ export class TeseraSender {
     const target = Math.min(this.congestion * 1.5, Math.max(cubic, reno))
     const step = target > this.congestion ? (target - this.congestion) / this.congestion : 0.01 / this.congestion
     this.congestion = Math.min(this.window, this.congestion + step)
+  }
+
+  /**
+   * A block whose resends keep being lost has outlived its own repair. A cut once per window can't
+   * see that when the window is stuck behind this block, since every loss is then below
+   * `recoverFrom`, so the window falls to its floor and slow start finds the path again, as TCP
+   * does after a retransmission timeout. A block the receiver already holds lost only its ACK, and
+   * does not count.
+   */
+  private collapse(): void {
+    if (!this.scheduler.hasObservation || this.transportHeld()) return
+    const floor = Math.min(this.window, MIN_WINDOW)
+    if (this.congestion <= floor) return
+    this.undo = null
+    this.lossWindow = this.congestion
+    this.slowStartUntil = Math.max(floor, this.congestion / 2)
+    this.congestion = floor
+    this.growthFrom = this.clock.mono()
+    this.growthPeakSec = Math.cbrt((this.lossWindow * (1 - CUBIC_BETA)) / CUBIC_C)
+    this.recoverFrom = this.nextBlockId
+    this.stats.windowCuts++
+    this.probe?.note("sender.window-collapse", this.congestion)
   }
 
   /**
