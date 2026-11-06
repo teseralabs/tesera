@@ -194,7 +194,7 @@ if the WebTransport packages are missing, or the listener can't start, the relay
 
 an attachment relay forwards everything its attachments send, so give it a higher `--bandwidth` than the default, see [operator policy](#operator-policy)
 
-safari needs an attachment relay whose WebTransport implementation advertises one session per connection. the published `@fails-components/webtransport-transport-http3-quiche` 1.6.8 binaries don't support this yet
+safari opens a WebTransport stream only once the relay grants it credit with the session flow-control capsules, `WT_MAX_STREAMS` and `WT_MAX_DATA`. the published `@fails-components/webtransport-transport-http3-quiche` 1.6.8 binaries never send them, so safari's datagrams get through but the stream it opens for hello and claim never does. chrome and firefox don't wait for that credit
 
 ## relay options
 
