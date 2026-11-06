@@ -21,8 +21,10 @@ import type { Probe } from "./probe.js"
 /**
  * Parameter sets remembered for one block. A new set may replace one that can no longer open,
  * or one with strictly fewer shards. Equal sets stay, so a fresh length cannot displace a set
- * that is just as far along. Two different lengths can still fill both slots before the honest
- * length is seen; telling those apart takes an authenticated header, which this protocol does not have.
+ * that is just as far along. Once a full block has opened, its length always has a slot and
+ * only one shorter length, which only the last block has, competes for the other. Before that,
+ * two different lengths can still fill both slots ahead of the honest one; telling those apart
+ * takes an authenticated header, which this protocol does not have.
  */
 const MAX_GROUPS = 2
 /**
@@ -133,6 +135,9 @@ export class TeseraReceiver {
   private sessionId: Buffer | null = null
   private k = 0
   private n = 0
+  /** cipherLen and shardLen of a full block, from the first block that opened without fin. Zero until then. */
+  private fullCipherLen = 0
+  private fullShardLen = 0
   private groupSeq = 0
   private nextDeliver = 0
   private highestSeen = -1
@@ -310,6 +315,11 @@ export class TeseraReceiver {
    */
   private acceptTessera(frame: DataFrame, via: number, remote: Endpoint): boolean {
     if (this.k !== 0 && (frame.k !== this.k || frame.n !== this.n)) return false
+    // An honest sender always cuts the ciphertext into k shards of ceil(cipherLen / k) bytes.
+    if (frame.payload.length !== Math.ceil(frame.cipherLen / frame.k)) return false
+    if (this.fullCipherLen !== 0 && !this.isFull(frame.cipherLen, frame.payload.length) && frame.cipherLen >= this.fullCipherLen) {
+      return false
+    }
     let partial = this.partials.get(frame.blockId)
     if (!partial) {
       partial = { groups: [], firstSeen: Date.now(), lastError: "" }
@@ -353,7 +363,7 @@ export class TeseraReceiver {
       partial.groups.push(created)
       return created
     }
-    const victim = this.evictionVictim(partial.groups)
+    const victim = this.placeVictim(partial.groups, created)
     if (!victim) return null
     const at = partial.groups.indexOf(victim)
     if (at < 0) return null
@@ -382,8 +392,9 @@ export class TeseraReceiver {
   private hold(group: ShardGroup, frame: DataFrame, via: number): boolean {
     const existing = group.shards.get(frame.tesseraIndex)
     if (!existing) {
+      // decodeFrame already gave the payload its own bytes, so it is kept without another copy.
       group.shards.set(frame.tesseraIndex, {
-        payload: Buffer.from(frame.payload),
+        payload: frame.payload,
         via,
         replaced: false,
         confirmed: false,
@@ -395,12 +406,26 @@ export class TeseraReceiver {
       return true
     }
     if (!group.suspect.has(frame.tesseraIndex) || existing.replaced) return false
-    existing.payload = Buffer.from(frame.payload)
+    existing.payload = frame.payload
     existing.via = via
     existing.replaced = true
     existing.confirmed = false
     group.suspect.delete(frame.tesseraIndex)
     return true
+  }
+
+  /**
+   * Once the full length is known, it always takes a slot, and a shorter length only competes
+   * with other shorter lengths. Before that every set competes alike.
+   */
+  private placeVictim(groups: ShardGroup[], incoming: ShardGroup): ShardGroup | null {
+    if (this.fullCipherLen === 0) return this.evictionVictim(groups)
+    if (this.isFull(incoming.cipherLen, incoming.shardLen)) return this.smallest(groups)
+    return this.evictionVictim(groups.filter((group) => !this.isFull(group.cipherLen, group.shardLen)))
+  }
+
+  private isFull(cipherLen: number, shardLen: number): boolean {
+    return cipherLen === this.fullCipherLen && shardLen === this.fullShardLen
   }
 
   /**
@@ -472,13 +497,17 @@ export class TeseraReceiver {
     combo: readonly number[],
     via: number,
   ): boolean {
-    const key = this.comboKey(group, combo)
-    group.rejected.add(key)
     group.decodes++
+    // The checksum key is only needed once a combination has failed, so a block that opens
+    // the first time never pays for it.
+    const reject = () => group.rejected.add(this.comboKey(group, combo))
     const parts: Array<{ index: number; data: Buffer }> = []
     for (const index of combo) {
       const shard = group.shards.get(index)
-      if (!shard) return false
+      if (!shard) {
+        reject()
+        return false
+      }
       parts.push({ index, data: shard.payload })
     }
     let opened: { fin: boolean; body: Buffer; sentAtMs: number }
@@ -511,10 +540,12 @@ export class TeseraReceiver {
     } catch (err) {
       if (asError(err).message === "missing traffic keys") throw err
       partial.lastError = asError(err).message
+      reject()
       for (const index of combo) group.suspect.add(index)
       return false
     }
     this.pinFrom(group.k, group.n)
+    if (!opened.fin) this.pinLength(group.cipherLen, group.shardLen)
     this.partials.delete(blockId)
     this.done.add(blockId)
     this.decoded.add(blockId)
@@ -557,6 +588,20 @@ export class TeseraReceiver {
     }
   }
 
+  /**
+   * A block that opened without fin is full, and every block but the last has its length.
+   * Sets that are longer, or as long but cut differently, can never open and are dropped.
+   */
+  private pinLength(cipherLen: number, shardLen: number): void {
+    if (this.fullCipherLen !== 0) return
+    this.fullCipherLen = cipherLen
+    this.fullShardLen = shardLen
+    for (const [id, partial] of [...this.partials]) {
+      partial.groups = partial.groups.filter((group) => this.isFull(group.cipherLen, group.shardLen) || group.cipherLen < cipherLen)
+      if (partial.groups.length === 0) this.partials.delete(id)
+    }
+  }
+
   /** Non-suspect indices first, so the next attempt leaves out a tessera that already failed. */
   private orderedIndices(group: ShardGroup): number[] {
     return [...group.shards.keys()].sort((a, b) => {
@@ -571,6 +616,7 @@ export class TeseraReceiver {
     const universe = this.orderedIndices(group)
     if (universe.length < group.k) return null
     let combo = universe.slice(0, group.k)
+    if (group.rejected.size === 0) return combo
     for (let step = 0; step < MAX_BLOCK_DECODES; step++) {
       if (!group.rejected.has(this.comboKey(group, combo))) return combo
       const next = this.nextCombo(combo, universe)
