@@ -1,3 +1,5 @@
+import { systemClock, type Clock } from "./clock.js"
+
 export class Signal {
   private waiters: Array<() => void> = []
 
@@ -14,22 +16,22 @@ export class Signal {
   }
 }
 
-export function sleep(ms: number): Promise<void> {
+export function sleep(ms: number, clock: Clock = systemClock): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, ms)
+    clock.setTimeout(resolve, ms)
   })
 }
 
 /** Wait for `work`, but no longer than `ms`. The timer is cleared either way, so it never holds a process open. */
-export async function waitAtMost(work: Promise<unknown>, ms: number): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined
+export async function waitAtMost(work: Promise<unknown>, ms: number, clock: Clock = systemClock): Promise<void> {
+  let timer: unknown
   const limit = new Promise<void>((resolve) => {
-    timer = setTimeout(resolve, ms)
+    timer = clock.setTimeout(resolve, ms)
   })
   try {
     await Promise.race([work.then(() => {}, () => {}), limit])
   } finally {
-    clearTimeout(timer)
+    clock.clearTimeout(timer)
   }
 }
 

@@ -1,4 +1,5 @@
 import { randomBytes } from "../crypto/primitives.js"
+import { systemClock, type Clock } from "../clock.js"
 import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { encodeShards, splitCiphertext } from "../coding/reedsolomon.js"
 import {
@@ -58,7 +59,7 @@ type BlockState = {
   nextRetxAt: number
   /** Wait before the next timed resend. Doubles after each resend. */
   backoffMs: number
-  /** performance.now() of the last resend, 0 before one. */
+  /** clock.mono() of the last resend, 0 before one. */
   resentAt: number
   /** Tessera indices the receiver sampled, so it holds them. */
   sampled: Set<number>
@@ -107,6 +108,8 @@ export type SenderOptions = {
    * match what the receiver was told. Omitted means every block, which every receiver does.
    */
   sampleEvery?: number
+  /** Where time comes from. Omitted means the system clock. */
+  clock?: Clock
   /** Timing notes for diagnostics. */
   probe?: Probe
 }
@@ -136,6 +139,7 @@ export class TeseraSender {
   private readonly maxBackoffMs: number
   private readonly tickMs: number
   private readonly sampleEvery: number
+  private readonly clock: Clock
   private readonly openTransport: OpenTransport
   private readonly id = randomBytes(16)
   private readonly scheduler: PathScheduler
@@ -159,11 +163,11 @@ export class TeseraSender {
   /** One shutdown, including the close notice. A second close waits for it. */
   private closing: Promise<void> | null = null
   private error: Error | null = null
-  private timer: ReturnType<typeof setTimeout> | null = null
+  private timer: unknown = null
   private deadlineAt = 0
   /** Set once a block ACK arrives, so a missing path sample cannot hold the window at one. */
   private opened = false
-  /** performance.now() of the last send or reply. The first send starts the stall clock. */
+  /** clock.mono() of the last send or reply. The first send starts the stall clock. */
   private lastProgressAt = 0
   /**
    * Blocks allowed in flight. Slow start adds one per ACK until the first loss. After that, CUBIC:
@@ -179,15 +183,15 @@ export class TeseraSender {
   private smoothedRttMs = 0
   private rttVarMs = 0
   private minRttMs = Infinity
-  /** performance.now() send time of the newest tessera that has been answered. */
+  /** clock.mono() send time of the newest tessera that has been answered. */
   private newestAnsweredAt = 0
   private undo: Undo | null = null
-  /** performance.now() of the last send the transport held back, and the blocks in flight then. */
+  /** clock.mono() of the last send the transport held back, and the blocks in flight then. */
   private blockedAt = -Infinity
   private blockedInflight = 0
   /** Loss on a block below this id was already answered by the last cut. */
   private recoverFrom = 0
-  /** Date.now() of the last block ACK, or of the send that started a busy period. */
+  /** clock.now() of the last block ACK, or of the send that started a busy period. */
   private lastAckAt = 0
   /** A verified close from the receiver is already the error. Don't answer it with another close. */
   private remoteClose = false
@@ -195,6 +199,7 @@ export class TeseraSender {
   private closeSent = false
 
   constructor(opts: SenderOptions) {
+    this.clock = opts.clock ?? systemClock
     assertSession(opts.session)
     const keys = deriveKeys(opts.session, this.id)
     this.aeadKey = keys.aeadKey
@@ -305,7 +310,7 @@ export class TeseraSender {
     await this.waitIdle()
     this.stopped = true
     if (this.timer) {
-      clearTimeout(this.timer)
+      this.clock.clearTimeout(this.timer)
       this.timer = null
     }
   }
@@ -315,7 +320,7 @@ export class TeseraSender {
     this.error = asError(err)
     this.stopped = true
     if (this.timer) {
-      clearTimeout(this.timer)
+      this.clock.clearTimeout(this.timer)
       this.timer = null
     }
     this.wake.notify()
@@ -341,7 +346,7 @@ export class TeseraSender {
     this.closed = true
     this.stopped = true
     if (this.timer) {
-      clearTimeout(this.timer)
+      this.clock.clearTimeout(this.timer)
       this.timer = null
     }
     const complete = this.finished && this.inflight.size === 0 && !this.error
@@ -362,7 +367,7 @@ export class TeseraSender {
     await this.waitForSlot()
     if (probe) probe.note("sender.slot-wait", performance.now() - waitFrom)
     if (this.error) throw this.error
-    if (this.deadlineAt === 0) this.deadlineAt = Date.now() + this.deadlineMs
+    if (this.deadlineAt === 0) this.deadlineAt = this.clock.now() + this.deadlineMs
     const blockId = this.nextBlockId++
     const t0 = performance.now()
     const cipherLen = sealedLength(owned.length)
@@ -372,7 +377,7 @@ export class TeseraSender {
       blockId,
       fin,
       owned,
-      Date.now(),
+      this.clock.now(),
       blockAad({
         sessionId: this.id,
         blockId,
@@ -419,14 +424,14 @@ export class TeseraSender {
       frames,
       placements: frames.map(() => null),
       sends: 1,
-      nextRetxAt: Date.now() + firstWait,
+      nextRetxAt: this.clock.now() + firstWait,
       backoffMs: firstWait,
       resentAt: 0,
       sampled: new Set(),
       measured,
       acked: false,
     }
-    if (this.inflight.size === 0) this.lastAckAt = Date.now()
+    if (this.inflight.size === 0) this.lastAckAt = this.clock.now()
     this.inflight.set(blockId, block)
     this.stats.blocks++
     this.stats.inputBytes += owned.length
@@ -484,7 +489,7 @@ export class TeseraSender {
         }
       }),
     )
-    await waitAtMost(sends, CLOSE_NOTICE_MS)
+    await waitAtMost(sends, CLOSE_NOTICE_MS, this.clock)
   }
 
   private async onMessage(msg: Buffer): Promise<void> {
@@ -514,7 +519,7 @@ export class TeseraSender {
       this.settleQuiet(block)
       block.acked = true
       this.opened = true
-      this.lastAckAt = Date.now()
+      this.lastAckAt = this.clock.now()
       this.undoSpuriousCut(block)
       this.grow()
       this.stats.windowSum += this.openWindow()
@@ -525,9 +530,9 @@ export class TeseraSender {
     }
     this.markProgress()
     // A NACK may speed up the first repair. Later resends wait out the block's backoff.
-    if (block.sends > 1 && Date.now() < block.nextRetxAt) return
+    if (block.sends > 1 && this.clock.now() < block.nextRetxAt) return
     const wanted = [...new Set(frame.missing)].filter((index) => index >= 0 && index < block.frames.length)
-    const ripe = wanted.filter((index) => !this.placementHeld(block, index, performance.now()))
+    const ripe = wanted.filter((index) => !this.placementHeld(block, index, this.clock.mono()))
     if (ripe.length === 0) return
     probe?.note("sender.retx-nack", ripe.length)
     await this.retransmit(block, ripe)
@@ -535,16 +540,16 @@ export class TeseraSender {
 
   private async repairTick(): Promise<void> {
     if (this.stopped) return
-    if (this.deadlineAt !== 0 && Date.now() > this.deadlineAt) {
+    if (this.deadlineAt !== 0 && this.clock.now() > this.deadlineAt) {
       this.fail(new Error("transfer timed out"))
       return
     }
-    const now = Date.now()
+    const now = this.clock.now()
     if (this.inflight.size > 0 && this.lastAckAt !== 0 && now - this.lastAckAt > this.idleMs) {
       this.fail(new Error(`no block was acknowledged for ${Math.round(this.idleMs / 1000)}s`))
       return
     }
-    const perfNow = performance.now()
+    const perfNow = this.clock.mono()
     const stalled = this.stalled(perfNow)
     this.expireLossWatches(now)
     for (const block of [...this.inflight.values()]) {
@@ -616,7 +621,7 @@ export class TeseraSender {
   }
 
   private markProgress(): void {
-    this.lastProgressAt = performance.now()
+    this.lastProgressAt = this.clock.mono()
   }
 
   private async retransmit(block: BlockState, indices: number[]): Promise<void> {
@@ -626,9 +631,9 @@ export class TeseraSender {
       return
     }
     block.sends++
-    block.resentAt = performance.now()
+    block.resentAt = this.clock.mono()
     block.backoffMs = Math.min(this.maxBackoffMs, block.backoffMs * 2)
-    block.nextRetxAt = Date.now() + block.backoffMs
+    block.nextRetxAt = this.clock.now() + block.backoffMs
     // With k tesserae sampled the receiver holds the block, so what went missing was its ACK: often
     // one random loss, but a return path at an operator's limit drops ACKs too, so it still counts.
     this.noteLoss(block.id, block.sampled.size >= this.k ? ACK_LOSS_BETA : CUBIC_BETA)
@@ -661,7 +666,7 @@ export class TeseraSender {
     const relay = this.relays[relayIndex]
     const receiver = this.receivers[relayIndex]
     if (!relay || !receiver) throw new Error("missing relay")
-    const sentAt = performance.now()
+    const sentAt = this.clock.mono()
     if (this.lastProgressAt === 0) this.lastProgressAt = sentAt
     block.placements[index] = { relay: relayIndex, sentAt, settled: false }
     if (block.measured) {
@@ -682,9 +687,9 @@ export class TeseraSender {
     if (retransmission) this.stats.tesseraRetransmissions++
     try {
       await transport.send(packet, relay)
-      const waited = performance.now() - sentAt
+      const waited = this.clock.mono() - sentAt
       if (waited >= TRANSPORT_HELD_MS) {
-        this.blockedAt = performance.now()
+        this.blockedAt = this.clock.mono()
         this.blockedInflight = this.inflight.size
       }
       if (this.probe) this.probe.note("sender.send", waited)
@@ -727,7 +732,7 @@ export class TeseraSender {
    * there was already answered by that control slowing down.
    */
   private transportHeld(): boolean {
-    return performance.now() - this.blockedAt < 2 * (this.smoothedRttMs || DEFAULT_RETX_AFTER_MS)
+    return this.clock.mono() - this.blockedAt < 2 * (this.smoothedRttMs || DEFAULT_RETX_AFTER_MS)
   }
 
   private grow(): void {
@@ -736,7 +741,7 @@ export class TeseraSender {
       this.congestion = Math.min(this.window, this.congestion + 1)
       return
     }
-    const t = (performance.now() - this.growthFrom) / 1000
+    const t = (this.clock.mono() - this.growthFrom) / 1000
     const cubic = CUBIC_C * (t - this.growthPeakSec) ** 3 + this.lossWindow
     // Never slower than Reno would grow from the same loss, so short paths keep up with TCP.
     const rttSec = Math.max(0.001, (this.smoothedRttMs || DEFAULT_RETX_AFTER_MS) / 1000)
@@ -778,7 +783,7 @@ export class TeseraSender {
     this.lossWindow = this.congestion < this.lossWindow ? (this.congestion * (1 + beta)) / 2 : this.congestion
     this.congestion = Math.max(floor, this.congestion * beta)
     this.slowStartUntil = this.congestion
-    this.growthFrom = performance.now()
+    this.growthFrom = this.clock.mono()
     this.growthPeakSec = Math.cbrt((this.lossWindow * (1 - beta)) / CUBIC_C)
     this.stats.windowCuts++
     this.probe?.note("sender.window-cut", this.congestion)
@@ -792,7 +797,7 @@ export class TeseraSender {
     const undo = this.undo
     if (!undo || undo.blockId !== block.id || block.resentAt === 0) return
     this.undo = null
-    if (performance.now() - block.resentAt >= this.minRttMs / 2) return
+    if (this.clock.mono() - block.resentAt >= this.minRttMs / 2) return
     this.congestion = undo.congestion
     this.slowStartUntil = undo.slowStartUntil
     this.lossWindow = undo.lossWindow
@@ -813,7 +818,7 @@ export class TeseraSender {
     const pending = this.awaitingSample.get(key)
     if (!pending) return
     this.awaitingSample.delete(key)
-    const rtt = performance.now() - pending.sentAt
+    const rtt = this.clock.mono() - pending.sentAt
     if (pending.sentAt > this.newestAnsweredAt) this.newestAnsweredAt = pending.sentAt
     this.probe?.note("sender.sample-rtt", rtt)
     this.stats.sampleRttSumMs += rtt
@@ -849,7 +854,7 @@ export class TeseraSender {
       pending.lossToken = this.scheduler.noteUnanswered(place.relay)
       const paced = this.scheduler.lossWaitMs(place.relay)
       const wait = Math.max(this.retxAfterMs / 2, Math.min(this.retxAfterMs, paced))
-      this.lossWatch.set(this.sampleKey(block.id, index), Date.now() + wait)
+      this.lossWatch.set(this.sampleKey(block.id, index), this.clock.now() + wait)
     }
   }
 
@@ -880,7 +885,7 @@ export class TeseraSender {
 
   private arm(): void {
     if (this.stopped || this.timer) return
-    this.timer = setTimeout(() => {
+    this.timer = this.clock.setTimeout(() => {
       this.timer = null
       if (this.stopped) return
       void this.repairTick()

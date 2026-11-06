@@ -9,6 +9,15 @@ import { encodeAck, encodeData } from "../src/protocol/frames.js"
 import { Relay } from "../src/relay/relay.js"
 import { PathScheduler } from "../src/transport/scheduler.js"
 import { sleep } from "../src/util.js"
+import { MemoryNetwork } from "./memory-network.js"
+import { VirtualClock } from "./virtual-clock.js"
+
+/** A transfer on an in-memory network and a virtual clock, 1 ms a hop, so a busy machine can't change its timing. */
+async function onClock(opts: Parameters<typeof runTransfer>[0]): ReturnType<typeof runTransfer> {
+  const clock = new VirtualClock()
+  const net = new MemoryNetwork(clock, 1)
+  return clock.run(runTransfer({ ...opts, clock, transport: () => net.transport() }))
+}
 
 async function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<void> {
   const started = Date.now()
@@ -466,7 +475,7 @@ describe("transfer", () => {
 
   it("reconstructs when one relay is a blackhole and does not retransmit", async () => {
     const payload = randomBytes(80_000)
-    const { metrics } = await runTransfer({
+    const { metrics } = await onClock({
       payload,
       adversity: [{ blackhole: true }, {}, {}],
       retxAfterMs: 500,
@@ -537,7 +546,7 @@ describe("transfer", () => {
   it("samples one block in four after the first few and still finishes cleanly", async () => {
     const payload = randomBytes(300_000)
     const run = (every: number) =>
-      runTransfer({ payload, senderSampleEvery: every, receiverSampleEvery: every, retxAfterMs: 500, nackAfterMs: 500, deadlineMs: 20_000 })
+      onClock({ payload, senderSampleEvery: every, receiverSampleEvery: every, retxAfterMs: 500, nackAfterMs: 500, deadlineMs: 20_000 })
     const every = await run(1)
     const sparse = await run(4)
     assert.deepEqual(sparse.output, payload)
@@ -553,7 +562,7 @@ describe("transfer", () => {
   it("keeps the round trip estimate when one block in four is sampled", async () => {
     const payload = randomBytes(200_000)
     const run = (every: number) =>
-      runTransfer({
+      onClock({
         payload,
         adversity: { delayMs: 15 },
         senderSampleEvery: every,
@@ -568,7 +577,7 @@ describe("transfer", () => {
   })
 
   it("survives loss, delay, and reordering with sparse samples", async () => {
-    const { output } = await runTransfer({
+    const { output } = await onClock({
       payload: randomBytes(40_000),
       adversity: { lossRate: 0.2, delayMs: 4, jitterMs: 6, reorderMs: 12 },
       seed: 7,
@@ -581,7 +590,7 @@ describe("transfer", () => {
 
   it("reconstructs past a blackhole relay with sparse samples", async () => {
     const payload = randomBytes(200_000)
-    const { output, metrics } = await runTransfer({
+    const { output, metrics } = await onClock({
       payload,
       adversity: [{ blackhole: true }, {}, {}],
       senderSampleEvery: 4,
@@ -596,7 +605,7 @@ describe("transfer", () => {
 
   it("works with a receiver that samples every block, as older ones do", async () => {
     const payload = randomBytes(200_000)
-    const { output, metrics } = await runTransfer({
+    const { output, metrics } = await onClock({
       payload,
       senderSampleEvery: 4,
       receiverSampleEvery: 1,
@@ -690,8 +699,8 @@ describe("transfer", () => {
   it("keeps splitting across relays and holds parity on one shared pipe", async () => {
     const payload = randomBytes(80_000)
     const pipe = { bandwidthBps: 4_000_000 }
-    const shared = await runTransfer({ payload, shared: pipe, deadlineMs: 15_000 })
-    const single = await runTransfer({
+    const shared = await onClock({ payload, shared: pipe, deadlineMs: 15_000 })
+    const single = await onClock({
       payload,
       k: 1,
       n: 1,

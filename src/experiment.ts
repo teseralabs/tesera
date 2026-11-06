@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto"
+import type { OpenTransport } from "./carrier/transport.js"
+import { systemClock, type Clock } from "./clock.js"
 import { buildMetrics, type TransferMetrics } from "./metrics.js"
 import { Relay } from "./relay/relay.js"
 import { CorrelatedGate, fillAdversity, PathSim, type Adversity } from "./sim/network.js"
@@ -41,6 +43,10 @@ export type RunOptions = {
   /** One block in this many is sampled after the first few. The sender and the receiver may differ, to model old peers. */
   senderSampleEvery?: number
   receiverSampleEvery?: number
+  /** Where time comes from for every relay and both ends. Omitted means the system clock. */
+  clock?: Clock
+  /** A new transport for each relay and each end, such as an in-memory network. Omitted means UDP. */
+  transport?: () => OpenTransport
   session?: Buffer
   tapRelays?: (relays: Relay[]) => void
 }
@@ -101,10 +107,13 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
     shared: sharedAdversity,
     window: opts.window ?? DEFAULT_WINDOW,
   })
-  const shared = sharedAdversity ? PathSim.from(sharedAdversity, seed + 50_000) : undefined
+  const clock = opts.clock ?? systemClock
+  const now = () => clock.now()
+  const wire = () => (opts.transport ? { transport: opts.transport() } : {})
+  const shared = sharedAdversity ? PathSim.from(sharedAdversity, seed + 50_000, now) : undefined
   const correlated =
     opts.correlatedLoss && opts.correlatedLoss > 0
-      ? new CorrelatedGate(opts.correlatedLoss, mulberry32(seed + 60_000), 25)
+      ? new CorrelatedGate(opts.correlatedLoss, mulberry32(seed + 60_000), 25, now)
       : undefined
   const session = opts.session ?? randomBytes(32)
   const relays: Relay[] = []
@@ -122,6 +131,8 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
         seed: seed + index * 9973,
         shared,
         correlated,
+        clock,
+        ...wire(),
       })
       await relay.start()
       relays.push(relay)
@@ -133,6 +144,8 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
       relays: relayEndpoints,
       nackAfterMs: opts.nackAfterMs ?? computed.nackAfterMs,
       ...(opts.receiverSampleEvery ? { sampleEvery: opts.receiverSampleEvery } : {}),
+      clock,
+      ...wire(),
     })
     await receiver.start()
     sender = new TeseraSender({
@@ -147,6 +160,8 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
       retxAfterMs: opts.retxAfterMs ?? computed.retxAfterMs,
       deadlineMs: opts.deadlineMs,
       ...(opts.senderSampleEvery ? { sampleEvery: opts.senderSampleEvery } : {}),
+      clock,
+      ...wire(),
     })
     await sender.start()
     receiver.setSender(sender.endpoint)
@@ -167,18 +182,18 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
       (err: unknown) => ({ ok: false as const, err }),
     )
 
-    const started = performance.now()
+    const started = clock.mono()
     await sender.write(opts.payload)
     await sender.end()
     const settled = await readerDone
     if (!settled.ok) throw asError(settled.err)
     const output = settled.output
-    const elapsedMs = performance.now() - started
+    const elapsedMs = clock.mono() - started
     const tailMs = adversity.reduce(
       (max, item) => Math.max(max, item.delayMs + item.jitterMs + item.reorderMs),
       0,
     )
-    await sleep(20 + tailMs)
+    await sleep(20 + tailMs, clock)
     const recovery = receiver.recoveryCounts()
     receiver.stats.blocksMissingSystematic = recovery.blocksMissingSystematic
     receiver.stats.blocksWithoutAllTesserae = recovery.blocksWithoutAllTesserae

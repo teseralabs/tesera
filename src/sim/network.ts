@@ -41,10 +41,11 @@ export class PathSim {
   constructor(
     readonly adversity: Adversity,
     private readonly random: () => number,
+    private readonly now: () => number = Date.now,
   ) {}
 
-  static from(adversity: Adversity, seed: number): PathSim {
-    return new PathSim(adversity, mulberry32(seed))
+  static from(adversity: Adversity, seed: number, now: () => number = Date.now): PathSim {
+    return new PathSim(adversity, mulberry32(seed), now)
   }
 
   admit(bytes: number): Admit {
@@ -56,7 +57,7 @@ export class PathSim {
     if (this.adversity.jitterMs > 0) wait += this.random() * this.adversity.jitterMs
     if (this.adversity.reorderMs > 0) wait += this.random() * this.adversity.reorderMs
     if (this.adversity.bandwidthBps > 0) {
-      const now = Date.now()
+      const now = this.now()
       const start = Math.max(now, this.nextAt)
       this.nextAt = start + (bytes * 8_000) / this.adversity.bandwidthBps
       wait += start - now
@@ -77,12 +78,13 @@ export class CorrelatedGate {
     private readonly rate: number,
     private readonly random: () => number,
     private readonly windowMs: number,
+    private readonly now: () => number = Date.now,
   ) {
     if (rate < 0 || rate > 1) throw new Error("correlated loss must be between 0 and 1")
   }
 
   closedNow(): boolean {
-    const now = Date.now()
+    const now = this.now()
     if (this.windowStart < 0 || now - this.windowStart >= this.windowMs) {
       this.windowStart = now
       this.closed = this.rate > 0 && this.random() < this.rate

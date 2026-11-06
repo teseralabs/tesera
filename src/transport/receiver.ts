@@ -1,3 +1,4 @@
+import { systemClock, type Clock } from "../clock.js"
 import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { decodeShards, joinShards } from "../coding/reedsolomon.js"
 import {
@@ -102,6 +103,8 @@ export type ReceiverOptions = {
    * Omitted means every block.
    */
   sampleEvery?: number
+  /** Where time comes from. Omitted means the system clock. */
+  clock?: Clock
 }
 
 export class TeseraReceiver {
@@ -116,6 +119,7 @@ export class TeseraReceiver {
   private readonly tickMs: number
   private readonly maxAhead: number
   private readonly sampleEvery: number
+  private readonly clock: Clock
   private readonly openTransport: OpenTransport
   private readonly probe: Probe | null
   private readonly partials = new Map<number, PartialBlock>()
@@ -161,9 +165,10 @@ export class TeseraReceiver {
   /** The one close this receiver will send. */
   private closeSent = false
   private error: Error | null = null
-  private timer: ReturnType<typeof setTimeout> | null = null
+  private timer: unknown = null
 
   constructor(opts: ReceiverOptions) {
+    this.clock = opts.clock ?? systemClock
     assertSession(opts.session)
     this.secret = opts.session
     if (opts.relays.length < 1) throw new Error("receiver needs at least one relay")
@@ -233,7 +238,7 @@ export class TeseraReceiver {
    */
   async linger(graceMs = DEFAULT_ACK_GRACE_MS): Promise<void> {
     if (!this.streamEnded || this.error || this.closed) return
-    await sleep(graceMs)
+    await sleep(graceMs, this.clock)
   }
 
   fail(err: unknown): void {
@@ -241,7 +246,7 @@ export class TeseraReceiver {
     this.error = asError(err)
     this.stopped = true
     if (this.timer) {
-      clearTimeout(this.timer)
+      this.clock.clearTimeout(this.timer)
       this.timer = null
     }
     this.readWake.notify()
@@ -266,7 +271,7 @@ export class TeseraReceiver {
     this.closed = true
     this.stopped = true
     if (this.timer) {
-      clearTimeout(this.timer)
+      this.clock.clearTimeout(this.timer)
       this.timer = null
     }
     const complete = this.streamEnded && !this.error
@@ -333,7 +338,7 @@ export class TeseraReceiver {
     }
     let partial = this.partials.get(frame.blockId)
     if (!partial) {
-      partial = { groups: [], firstSeen: Date.now(), lastError: "" }
+      partial = { groups: [], firstSeen: this.clock.now(), lastError: "" }
       this.partials.set(frame.blockId, partial)
       this.missingSince.delete(frame.blockId)
       this.probe?.step(frame.blockId, "first", performance.now())
@@ -562,7 +567,7 @@ export class TeseraReceiver {
     this.decoded.add(blockId)
     this.missingSince.delete(blockId)
     this.stats.blocksDecoded++
-    const latencyMs = Math.max(0, Date.now() - opened.sentAtMs)
+    const latencyMs = Math.max(0, this.clock.now() - opened.sentAtMs)
     this.ready.set(blockId, { body: opened.body, fin: opened.fin, latencyMs })
     this.drain()
     void this.ackOrHold(blockId, this.ackVia(group, combo, via)).catch((err) => this.fail(err))
@@ -775,7 +780,7 @@ export class TeseraReceiver {
     this.gapsFrom = Math.max(this.gapsFrom, this.highestSeen)
     for (let id = from; id < this.highestSeen; id++) {
       if (this.done.has(id) || this.partials.has(id) || this.ready.has(id) || this.missingSince.has(id)) continue
-      this.missingSince.set(id, Date.now())
+      this.missingSince.set(id, this.clock.now())
     }
   }
 
@@ -816,7 +821,7 @@ export class TeseraReceiver {
   private async nackTick(): Promise<void> {
     const n = this.knownN()
     if (this.stopped || !this.senders || n === 0) return
-    const now = Date.now()
+    const now = this.clock.now()
     for (const id of this.nackPace.keys()) {
       if (!this.partials.has(id) && !this.missingSince.has(id)) this.nackPace.delete(id)
     }
@@ -896,7 +901,7 @@ export class TeseraReceiver {
         }
       }),
     )
-    await waitAtMost(sends, CLOSE_NOTICE_MS)
+    await waitAtMost(sends, CLOSE_NOTICE_MS, this.clock)
   }
 
   private async sendSample(blockId: number, tesseraIndex: number, remote: Endpoint): Promise<void> {
@@ -966,7 +971,7 @@ export class TeseraReceiver {
 
   private arm(): void {
     if (this.stopped || this.timer) return
-    this.timer = setTimeout(() => {
+    this.timer = this.clock.setTimeout(() => {
       this.timer = null
       if (this.stopped) return
       void this.nackTick()
