@@ -97,16 +97,23 @@ export class PathScheduler {
     return this.queueShared
   }
 
-  /** Relay per tessera index. null means skip that parity tessera. */
-  plan(): Array<number | null> {
+  /**
+   * Relay per tessera index. null means skip that parity tessera. A block that will not be
+   * sampled is placed the same way but opens no cohort, since nothing will report on it.
+   */
+  plan(measure = true): Array<number | null> {
     if (this.coupled || this.lossCoupled()) {
       this.coupled = true
       this.activeCohort = -1
       return this.soloPlan()
     }
-    const cohort = this.nextCohort++
-    this.activeCohort = cohort
-    this.cohorts.set(cohort, { paths: new Set(), ok: new Set(), bad: new Set(), open: 0 })
+    if (measure) {
+      const cohort = this.nextCohort++
+      this.activeCohort = cohort
+      this.cohorts.set(cohort, { paths: new Set(), ok: new Set(), bad: new Set(), open: 0 })
+    } else {
+      this.activeCohort = -1
+    }
     if (this.queueShared) {
       const striped = this.stripePlan()
       if (striped) return striped
@@ -176,6 +183,15 @@ export class PathScheduler {
     if (recorded >= 0) this.cohortExpected.set(recorded, (this.cohortExpected.get(recorded) ?? 0) + 1)
     this.loadQ[relay]?.push({ cohort: recorded, seq: this.seq++, base: this.rtt[relay] ?? 0 })
     return recorded
+  }
+
+  /**
+   * A send no sample will answer. It holds an inflight slot until `release`, and is never matched
+   * to a round trip or scored as delivered or lost, so it cannot skew either.
+   */
+  noteQuietSend(relay: number): void {
+    this.at(relay)
+    this.inflight[relay] = (this.inflight[relay] ?? 0) + 1
   }
 
   observe(relay: number, rttMs: number, cohort = -1): void {

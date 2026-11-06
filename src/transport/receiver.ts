@@ -2,6 +2,8 @@ import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport
 import { decodeShards, joinShards } from "../coding/reedsolomon.js"
 import {
   assertCode,
+  assertSampleEvery,
+  sampledBlock,
   CLOSE_NOTICE_MS,
   DEFAULT_ACK_GRACE_MS,
   DEFAULT_NACK_AFTER_MS,
@@ -94,6 +96,12 @@ export type ReceiverOptions = {
    * Omitted means the first block that opens authenticates them.
    */
   coding?: { k: number; n: number }
+  /**
+   * Send a SAMPLE for one block in this many after the first few, by `sampledBlock`. It must be
+   * what the sender asked for, since the sender waits only for the samples this rule sends.
+   * Omitted means every block.
+   */
+  sampleEvery?: number
 }
 
 export class TeseraReceiver {
@@ -107,6 +115,7 @@ export class TeseraReceiver {
   private readonly nackAfterMs: number
   private readonly tickMs: number
   private readonly maxAhead: number
+  private readonly sampleEvery: number
   private readonly openTransport: OpenTransport
   private readonly probe: Probe | null
   private readonly partials = new Map<number, PartialBlock>()
@@ -163,6 +172,8 @@ export class TeseraReceiver {
     this.nackAfterMs = opts.nackAfterMs ?? DEFAULT_NACK_AFTER_MS
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
     this.maxAhead = opts.maxAhead ?? MAX_AHEAD
+    this.sampleEvery = opts.sampleEvery ?? 1
+    assertSampleEvery(this.sampleEvery)
     this.maxUnreadBytes = opts.maxUnreadBytes ?? Infinity
     if (!(this.maxUnreadBytes > 0)) throw new Error("maxUnreadBytes must be > 0")
     this.openTransport = transportOrUdp(opts)
@@ -336,7 +347,7 @@ export class TeseraReceiver {
     // The sample has to leave before the ACK. The sender learns the round trip from it, and only
     // then stretches the resend timer. An ACK that arrives first opens the window on the old timer.
     const first = this.noteArrival(frame.blockId, frame.tesseraIndex)
-    if (first) void this.sendSample(frame.blockId, frame.tesseraIndex, remote).catch(() => {})
+    if (first && sampledBlock(frame.blockId, this.sampleEvery)) void this.sendSample(frame.blockId, frame.tesseraIndex, remote).catch(() => {})
     if (frame.blockId > this.highestSeen) this.highestSeen = frame.blockId
     this.noteGaps()
     this.noteBuffer()

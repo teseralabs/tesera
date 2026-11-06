@@ -18,6 +18,12 @@ import { writeSink, type Sink } from "./sink.js"
 import { readSource, type ChunkReader, type Source } from "./source.js"
 import type { ClientTransport, ConnectHints, Endpoint, TransportConnection, TransportEvents } from "./transport.js"
 
+/**
+ * A browser sender asks for a SAMPLE on one block in 4 after the first 16, which cuts the control
+ * datagrams a relay forwards by about half. On loopback a transfer ran about half again as fast.
+ */
+const SAMPLE_EVERY = 4
+
 /** Application bytes, never coding or retransmission overhead. */
 export type Progress = {
   /** Bytes read from the source (sending) or written to the sink (receiving). */
@@ -128,7 +134,15 @@ export class TeseraClient {
       throw err
     })
     const secret = randomBytes(32)
-    const sender = new TeseraSender({ session: secret, relays, k, n, transport: wire.open(connection), ...(this.probe ? { probe: this.probe } : {}) })
+    const sender = new TeseraSender({
+      session: secret,
+      relays,
+      k,
+      n,
+      sampleEvery: SAMPLE_EVERY,
+      transport: wire.open(connection),
+      ...(this.probe ? { probe: this.probe } : {}),
+    })
     const size = opts.size ?? reader.size
     const offer: TransferOffer = {
       v: OFFER_VERSION,
@@ -138,6 +152,7 @@ export class TeseraClient {
       k,
       n,
       ...(size === undefined ? {} : { size }),
+      sampleEvery: SAMPLE_EVERY,
     }
     return new OutgoingTransfer(offer, secretHex(secret), sender, connection, wire, reader, opts, this.probe)
   }
@@ -167,6 +182,7 @@ export class TeseraClient {
         transport: wire.open(connection),
         maxUnreadBytes: maxBuffered,
         coding: { k: offer.k, n: offer.n },
+        sampleEvery: offer.sampleEvery ?? 1,
         ...(this.probe ? { probe: this.probe } : {}),
       })
       await receiver.start()

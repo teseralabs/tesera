@@ -2,6 +2,8 @@ import { randomBytes } from "../crypto/primitives.js"
 import { transportOrUdp, type Endpoint, type OpenTransport, type PacketTransport } from "../carrier/transport.js"
 import { encodeShards, splitCiphertext } from "../coding/reedsolomon.js"
 import {
+  assertSampleEvery,
+  sampledBlock,
   assertCode,
   assertShardSize,
   CLOSE_NOTICE_MS,
@@ -60,6 +62,8 @@ type BlockState = {
   resentAt: number
   /** Tessera indices the receiver sampled, so it holds them. */
   sampled: Set<number>
+  /** The receiver samples this block. A block it does not sample is judged by its ACK alone. */
+  measured: boolean
   acked: boolean
 }
 
@@ -98,6 +102,11 @@ export type SenderOptions = {
   /** Time allowed without a block acknowledgement while blocks are in flight. */
   idleMs?: number
   tickMs?: number
+  /**
+   * The receiver samples one block in this many after the first few, by `sampledBlock`. It must
+   * match what the receiver was told. Omitted means every block, which every receiver does.
+   */
+  sampleEvery?: number
   /** Timing notes for diagnostics. */
   probe?: Probe
 }
@@ -126,6 +135,7 @@ export class TeseraSender {
   private readonly idleMs: number
   private readonly maxBackoffMs: number
   private readonly tickMs: number
+  private readonly sampleEvery: number
   private readonly openTransport: OpenTransport
   private readonly id = randomBytes(16)
   private readonly scheduler: PathScheduler
@@ -211,6 +221,8 @@ export class TeseraSender {
     this.maxBackoffMs = Math.max(MAX_RETX_BACKOFF_MS, this.retxAfterMs)
     this.congestion = Math.min(this.window, INITIAL_WINDOW)
     this.tickMs = opts.tickMs ?? DEFAULT_TICK_MS
+    this.sampleEvery = opts.sampleEvery ?? 1
+    assertSampleEvery(this.sampleEvery)
     this.openTransport = transportOrUdp(opts)
     this.scheduler = new PathScheduler(this.relays.length, this.k, this.n)
     this.probe = opts.probe ?? null
@@ -392,7 +404,8 @@ export class TeseraSender {
         payload: Buffer.from(shard),
       }),
     )
-    const plan = this.scheduler.plan()
+    const measured = sampledBlock(blockId, this.sampleEvery)
+    const plan = this.scheduler.plan(measured)
     if (probe) {
       probe.note("sender.frame", performance.now() - t2)
       probe.note("sender.tesserae-planned", plan.filter((relay) => relay !== null).length)
@@ -410,6 +423,7 @@ export class TeseraSender {
       backoffMs: firstWait,
       resentAt: 0,
       sampled: new Set(),
+      measured,
       acked: false,
     }
     if (this.inflight.size === 0) this.lastAckAt = Date.now()
@@ -621,7 +635,11 @@ export class TeseraSender {
     for (const index of indices) {
       if (this.stopped || block.acked) return
       const place = block.placements[index]
-      if (place && !place.settled) {
+      if (place && !place.settled && !block.measured) {
+        // No sample was coming, so the resend says nothing about which path dropped it.
+        place.settled = true
+        this.scheduler.release(place.relay)
+      } else if (place && !place.settled) {
         place.settled = true
         const pending = this.awaitingSample.get(this.sampleKey(block.id, index))
         this.scheduler.miss(place.relay, pending?.cohort ?? -1)
@@ -646,14 +664,18 @@ export class TeseraSender {
     const sentAt = performance.now()
     if (this.lastProgressAt === 0) this.lastProgressAt = sentAt
     block.placements[index] = { relay: relayIndex, sentAt, settled: false }
-    const cohort = this.scheduler.noteSend(relayIndex, !retransmission)
-    this.awaitingSample.set(this.sampleKey(block.id, index), {
-      relay: relayIndex,
-      sentAt,
-      inflight: true,
-      cohort,
-      lossToken: 0,
-    })
+    if (block.measured) {
+      const cohort = this.scheduler.noteSend(relayIndex, !retransmission)
+      this.awaitingSample.set(this.sampleKey(block.id, index), {
+        relay: relayIndex,
+        sentAt,
+        inflight: true,
+        cohort,
+        lossToken: 0,
+      })
+    } else {
+      this.scheduler.noteQuietSend(relayIndex)
+    }
     const packet = encodeEnvelope(receiver, frame)
     this.stats.dataWireBytes += packet.length
     this.stats.tesseraSends++

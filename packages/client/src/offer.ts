@@ -1,4 +1,4 @@
-import { assertCode, MAX_N, SESSION_ID_LEN } from "./core.js"
+import { assertCode, MAX_N, MAX_SAMPLE_EVERY, SESSION_ID_LEN } from "./core.js"
 import { TeseraError } from "./errors.js"
 import type { Endpoint } from "./transport.js"
 
@@ -22,6 +22,12 @@ export type TransferOffer = {
   n: number
   /** Total bytes, when the sender knows them. */
   size?: number
+  /**
+   * The receiver samples one block in this many after the first few. Offers from 0.1.2-beta and
+   * earlier leave it out, and a receiver then samples every block. A receiver from before this
+   * field ignores it and samples every block, which a sender handles.
+   */
+  sampleEvery?: number
 }
 
 /** What a receiver sends back so the sender can start. It holds no key material. */
@@ -51,6 +57,13 @@ export function parseOffer(value: unknown): TransferOffer {
   if (size !== undefined && !(typeof size === "number" && Number.isSafeInteger(size) && size >= 0)) {
     throw new TeseraError("invalid", "an offer's size must be a whole number of bytes")
   }
+  const sampleEvery = offer["sampleEvery"]
+  if (
+    sampleEvery !== undefined &&
+    !(typeof sampleEvery === "number" && Number.isInteger(sampleEvery) && sampleEvery >= 1 && sampleEvery <= MAX_SAMPLE_EVERY)
+  ) {
+    throw new TeseraError("invalid", `an offer's sampleEvery must be a whole number from 1 to ${MAX_SAMPLE_EVERY}`)
+  }
   return {
     v: OFFER_VERSION,
     sessionId: sessionHex(offer["sessionId"]),
@@ -59,6 +72,7 @@ export function parseOffer(value: unknown): TransferOffer {
     k,
     n,
     ...(size === undefined ? {} : { size }),
+    ...(sampleEvery === undefined ? {} : { sampleEvery }),
   }
 }
 

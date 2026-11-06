@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert"
 import { randomBytes } from "node:crypto"
 import { describe, it } from "node:test"
-import { fullBlockBodySize } from "../src/constants.js"
+import { fullBlockBodySize, SAMPLE_ALL_FIRST, sampledBlock } from "../src/constants.js"
 import { bindUdp, closeUdp, createUdpSocket, sendUdp } from "../src/carrier/udp.js"
 import { runTransfer } from "../src/experiment.js"
 import { encodeEnvelope } from "../src/protocol/envelope.js"
@@ -29,6 +29,27 @@ function feedCohort(scheduler: PathScheduler, rttAt: (index: number) => number):
 }
 
 describe("scheduler", () => {
+  it("samples every early block, then one in every few, by one rule for both ends", () => {
+    for (let id = 0; id < SAMPLE_ALL_FIRST; id++) assert.equal(sampledBlock(id, 4), true)
+    const later = Array.from({ length: 8 }, (_, i) => sampledBlock(SAMPLE_ALL_FIRST + i, 4))
+    assert.deepEqual(later, [true, false, false, false, true, false, false, false])
+    for (let id = 0; id < 100; id++) assert.equal(sampledBlock(id, 1), true)
+  })
+
+  it("keeps quiet sends out of round trips and loss", () => {
+    const scheduler = new PathScheduler(2, 1, 2)
+    scheduler.plan(false)
+    scheduler.noteQuietSend(0)
+    scheduler.noteQuietSend(1)
+    scheduler.plan()
+    const cohort = scheduler.noteSend(0)
+    scheduler.observe(0, 30, cohort)
+    scheduler.release(0)
+    scheduler.release(1)
+    assert.equal(scheduler.rttMs(0), 30)
+    assert.equal(scheduler.rttMs(1), 0)
+  })
+
   it("spreads a block while every path is unknown", () => {
     const scheduler = new PathScheduler(3, 2, 3)
     assert.deepEqual(scheduler.plan(), [0, 1, 2])
@@ -511,6 +532,81 @@ describe("transfer", () => {
     assert.equal(output.length, 60_000)
     // The first block goes out before any round trip is measured, so only it may be resent.
     assert.ok(metrics.tesseraRetransmissions <= 1, `${metrics.tesseraRetransmissions} retransmissions`)
+  })
+
+  it("samples one block in four after the first few and still finishes cleanly", async () => {
+    const payload = randomBytes(300_000)
+    const run = (every: number) =>
+      runTransfer({ payload, senderSampleEvery: every, receiverSampleEvery: every, retxAfterMs: 500, nackAfterMs: 500, deadlineMs: 20_000 })
+    const every = await run(1)
+    const sparse = await run(4)
+    assert.deepEqual(sparse.output, payload)
+    assert.equal(sparse.metrics.tesseraRetransmissions, 0)
+    assert.equal(sparse.metrics.windowCuts, 0)
+    assert.ok(
+      sparse.metrics.samplesAnswered < every.metrics.samplesAnswered * 0.5,
+      `${sparse.metrics.samplesAnswered} samples against ${every.metrics.samplesAnswered}`,
+    )
+    assert.ok(sparse.metrics.controlWireBytes < every.metrics.controlWireBytes, "fewer control bytes")
+  })
+
+  it("keeps the round trip estimate when one block in four is sampled", async () => {
+    const payload = randomBytes(200_000)
+    const run = (every: number) =>
+      runTransfer({
+        payload,
+        adversity: { delayMs: 15 },
+        senderSampleEvery: every,
+        receiverSampleEvery: every,
+        deadlineMs: 20_000,
+      })
+    const every = await run(1)
+    const sparse = await run(4)
+    assert.deepEqual(sparse.output, payload)
+    const ratio = sparse.metrics.meanSampleRttMs / every.metrics.meanSampleRttMs
+    assert.ok(ratio > 0.7 && ratio < 1.4, `mean sample round trip ${sparse.metrics.meanSampleRttMs} against ${every.metrics.meanSampleRttMs}`)
+  })
+
+  it("survives loss, delay, and reordering with sparse samples", async () => {
+    const { output } = await runTransfer({
+      payload: randomBytes(40_000),
+      adversity: { lossRate: 0.2, delayMs: 4, jitterMs: 6, reorderMs: 12 },
+      seed: 7,
+      senderSampleEvery: 4,
+      receiverSampleEvery: 4,
+      deadlineMs: 20_000,
+    })
+    assert.equal(output.length, 40_000)
+  })
+
+  it("reconstructs past a blackhole relay with sparse samples", async () => {
+    const payload = randomBytes(200_000)
+    const { output, metrics } = await runTransfer({
+      payload,
+      adversity: [{ blackhole: true }, {}, {}],
+      senderSampleEvery: 4,
+      receiverSampleEvery: 4,
+      retxAfterMs: 500,
+      nackAfterMs: 500,
+      deadlineMs: 20_000,
+    })
+    assert.deepEqual(output, payload)
+    assert.equal(metrics.tesseraRetransmissions, 0)
+  })
+
+  it("works with a receiver that samples every block, as older ones do", async () => {
+    const payload = randomBytes(200_000)
+    const { output, metrics } = await runTransfer({
+      payload,
+      senderSampleEvery: 4,
+      receiverSampleEvery: 1,
+      retxAfterMs: 500,
+      nackAfterMs: 500,
+      deadlineMs: 20_000,
+    })
+    assert.deepEqual(output, payload)
+    assert.equal(metrics.tesseraRetransmissions, 0)
+    assert.equal(metrics.windowCuts, 0)
   })
 
   it("does not put plaintext on the relay path", async () => {

@@ -38,6 +38,9 @@ export type RunOptions = {
   nackAfterMs?: number
   retxAfterMs?: number
   deadlineMs?: number
+  /** One block in this many is sampled after the first few. The sender and the receiver may differ, to model old peers. */
+  senderSampleEvery?: number
+  receiverSampleEvery?: number
   session?: Buffer
   tapRelays?: (relays: Relay[]) => void
 }
@@ -129,6 +132,7 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
       session,
       relays: relayEndpoints,
       nackAfterMs: opts.nackAfterMs ?? computed.nackAfterMs,
+      ...(opts.receiverSampleEvery ? { sampleEvery: opts.receiverSampleEvery } : {}),
     })
     await receiver.start()
     sender = new TeseraSender({
@@ -142,6 +146,7 @@ export async function runTransfer(opts: RunOptions): Promise<TransferResult> {
       maxSends: opts.maxSends,
       retxAfterMs: opts.retxAfterMs ?? computed.retxAfterMs,
       deadlineMs: opts.deadlineMs,
+      ...(opts.senderSampleEvery ? { sampleEvery: opts.senderSampleEvery } : {}),
     })
     await sender.start()
     receiver.setSender(sender.endpoint)
